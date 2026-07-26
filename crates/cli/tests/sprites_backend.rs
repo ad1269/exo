@@ -1,6 +1,5 @@
 //! Wiremock-driven tests for the Sprites sandbox backend.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,6 +11,7 @@ use exoharness::{
     SpritesConfig, SpritesSandboxBackend,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -35,14 +35,41 @@ fn make_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
     }
 }
 
+/// Mirrors `exoharness`'s `StableHasher`: SHA-256 over the hashed byte stream,
+/// so sandbox identity survives a toolchain bump.
+#[derive(Default)]
+struct StableHasher(Sha256);
+
+impl StableHasher {
+    fn finish_hex(self) -> String {
+        let digest = self.0.finalize();
+        let mut leading = [0u8; 16];
+        leading.copy_from_slice(&digest[..16]);
+        format!("{:032x}", u128::from_be_bytes(leading))
+    }
+}
+
+impl Hasher for StableHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        let digest = self.0.clone().finalize();
+        let mut leading = [0u8; 8];
+        leading.copy_from_slice(&digest[..8]);
+        u64::from_be_bytes(leading)
+    }
+}
+
 fn sandbox_spec_hash(spec: &SandboxSpec) -> String {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = StableHasher::default();
     spec.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    hasher.finish_hex()
 }
 
 fn expected_sprite_name(request: &SandboxRequest) -> String {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = StableHasher::default();
     request.key.hash(&mut hasher);
     sandbox_spec_hash(&request.spec).hash(&mut hasher);
     format!("exo-{:016x}", hasher.finish())

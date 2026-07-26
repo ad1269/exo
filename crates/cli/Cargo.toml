@@ -35,5 +35,6 @@ exoharness = { path = "../exoharness", features = [
   "contract-tests",
 ] }
 futures.workspace = true
+sha2 = "0.10.9"
 tempfile = "3.23.0"
 wiremock = "0.6"
