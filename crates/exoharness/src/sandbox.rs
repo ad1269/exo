@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time;
@@ -1764,10 +1765,46 @@ fn is_already_exists_error(message: &str) -> bool {
     lower.contains("already exists")
 }
 
+/// Hash of the spec a warm or remote sandbox was built from. Written to the
+/// `exo.sandbox.spec-hash` label and folded into remote sandbox names, so two
+/// processes only agree on a sandbox if they agree on this string.
 pub(crate) fn sandbox_spec_hash(spec: &SandboxSpec) -> String {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = StableHasher::default();
     spec.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    hasher.finish_hex()
+}
+
+/// [`Hasher`] that digests the hashed byte stream with SHA-256.
+///
+/// `DefaultHasher` is explicitly not stable across Rust releases, so it can
+/// only be used for hashes that live inside one process. Sandbox identity does
+/// not: labels and names are matched by later processes, which may have been
+/// built by a different toolchain.
+#[derive(Default)]
+pub(crate) struct StableHasher(Sha256);
+
+impl StableHasher {
+    /// The leading 128 bits of the digest, hex-encoded.
+    pub(crate) fn finish_hex(self) -> String {
+        let digest = self.0.finalize();
+        let mut leading = [0u8; 16];
+        leading.copy_from_slice(&digest[..16]);
+        format!("{:032x}", u128::from_be_bytes(leading))
+    }
+}
+
+impl Hasher for StableHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// The leading 64 bits of the digest.
+    fn finish(&self) -> u64 {
+        let digest = self.0.clone().finalize();
+        let mut leading = [0u8; 8];
+        leading.copy_from_slice(&digest[..8]);
+        u64::from_be_bytes(leading)
+    }
 }
 
 fn render_command_error(stderr: &[u8]) -> String {
@@ -1779,6 +1816,8 @@ fn network_name_for_policy(policy: SandboxNetworkPolicy) -> Option<&'static str>
 }
 
 fn new_warm_container_name(key: &SandboxKey) -> String {
+    // `DefaultHasher` is fine here: the name is minted fresh per container (note
+    // the generation suffix) and never re-derived — lookups go through labels.
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     let hash = hasher.finish();
@@ -1924,6 +1963,30 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the spec hash. It is written to warm sandbox labels and folded into
+    /// remote sandbox names, so a process only finds a sandbox another process
+    /// created if both derive the same string. Changing this value orphans every
+    /// warm sandbox and strands every remote one — worth doing deliberately,
+    /// never silently. The digest is SHA-256 over the derived `Hash` byte
+    /// stream, so this also catches a change in either half.
+    #[test]
+    fn sandbox_spec_hash_is_pinned() {
+        let spec = SandboxSpec {
+            image: "ubuntu:24.04".to_string(),
+            mounts: vec![SandboxMount {
+                host_path: PathBuf::from("/host/work"),
+                guest_path: "/work".to_string(),
+                access: SandboxMountAccess::ReadWrite,
+                internal: false,
+            }],
+            durable_file_systems: Vec::new(),
+            network: SandboxNetworkPolicy::Disabled,
+            default_workdir: "/work".to_string(),
+        };
+
+        assert_eq!(sandbox_spec_hash(&spec), "9a0b60b227af8781b5970659248f3a73");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

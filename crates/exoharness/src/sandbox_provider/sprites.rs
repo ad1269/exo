@@ -7,7 +7,6 @@
 //! as Docker labels / E2B metadata). Snapshots are bytes-by-reference via
 //! [`SnapshotKind::SpritesSnapshot`] manifests pointing at a checkpoint id.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -28,8 +27,8 @@ use url::Url;
 
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
-    WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+    SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload, StableHasher,
+    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 
 pub const DEFAULT_SPRITES_API_URL: &str = "https://api.sprites.dev";
@@ -723,7 +722,7 @@ fn parse_checkpoint_id_from_stream(body: &str) -> Result<String> {
 /// per organization; hashing the exo key and spec hash gives stable cross-process resume.
 fn sprite_name_for_request(request: &SandboxRequest) -> String {
     let spec_hash = sandbox_spec_hash(&request.spec);
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = StableHasher::default();
     request.key.hash(&mut hasher);
     spec_hash.hash(&mut hasher);
     format!("exo-{:016x}", hasher.finish())
