@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, Generate, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::{Result, Secret};
 
@@ -191,16 +190,11 @@ fn deserialize_key(serialized: &str) -> Result<[u8; MASTER_KEY_LEN]> {
 }
 
 fn random_master_key() -> [u8; MASTER_KEY_LEN] {
-    let mut key = [0u8; MASTER_KEY_LEN];
-    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-    key
+    <[u8; MASTER_KEY_LEN]>::generate()
 }
 
 fn random_nonce() -> [u8; NONCE_LEN] {
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&Uuid::new_v4().as_bytes()[..NONCE_LEN]);
-    nonce
+    <[u8; NONCE_LEN]>::generate()
 }
 
 #[cfg(feature = "apple-keychain")]
