@@ -30,7 +30,7 @@ aws-agentcore = [
 contract-tests = []
 
 [dependencies]
-aes-gcm = { version = "0.11.0-rc.3", optional = true }
+aes-gcm = { version = "0.11.0-rc.3", features = ["rand_core"], optional = true }
 actix-web = { workspace = true, optional = true }
 anyhow.workspace = true
 async-trait.workspace = true
