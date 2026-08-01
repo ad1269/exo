@@ -19,6 +19,15 @@ import { writeWorkerEvent } from "./protocol";
 //   state re-opens redelivery for anything still inflight in the runtime.
 // - The ledger says "this id was sent", not "the platform kept it". A send the
 //   platform accepted and later discarded is not resent.
+// - Durability here means process-crash durability, which is the threat model:
+//   the worker dies between the platform send and the ack. Every append is
+//   fsynced and compaction swaps atomically, both of which survive that.
+//   Machine-level power loss is explicitly NOT covered on the very first
+//   write, because POSIX requires fsyncing the PARENT DIRECTORY for a newly
+//   created filename to survive and this does not do it. Accepted rather than
+//   fixed: a lost file reads as an empty ledger, which degrades to pre-ledger
+//   behavior instead of corrupting anything, and directory fsync in node is
+//   platform-fussy enough to cost more than the edge is worth.
 //
 // `sendOnce` below is the only blessed way to perform a send; the ordering it
 // guarantees is the whole point of the ledger.
@@ -59,6 +68,14 @@ export function sentLedgerPath(adapterType: string): string {
 // from inflight. Every ack carries a `disposition`, which is the observability
 // of this fix: without it a suppressed redelivery is indistinguishable from a
 // fresh send in the event stream.
+//
+// This assumes serial command processing, and every worker provides it: each
+// drives its command stream with `for await (const line of input)` and awaits
+// this call before pulling the next line. That is load-bearing. `has` and
+// `record` straddle an await, so a worker that dispatched commands
+// concurrently could let two deliveries of the same id both pass the `has`
+// check before either recorded — reintroducing the duplicate this exists to
+// prevent.
 //
 // `deliver` throwing is a real send failure — the id is NOT recorded and no ack
 // is emitted, so the error propagates to the caller's existing nack path and
@@ -177,13 +194,33 @@ function appendId(ledgerPath: string, commandId: string): void {
   }
 }
 
+// Compaction replaces the ledger rather than editing it: write the survivors to
+// a temp file, flush them, then rename over the old one. Rename is atomic, so a
+// crash mid-compaction leaves either the whole old ledger or the whole new one
+// — never a half-written file. Truncating in place would have made the same
+// crash lose the ledger outright, which is the one failure the ledger exists to
+// prevent. The fsync is what makes the swap honest: without it the rename can
+// reach disk before the bytes it points at.
 function rewriteLedger(ledgerPath: string, ids: string[]): void {
   const tempPath = `${ledgerPath}.tmp`;
+  let handle: number | null = null;
   try {
     fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
-    fs.writeFileSync(tempPath, ids.map((id) => `${id}\n`).join(""));
+    handle = fs.openSync(tempPath, "w");
+    fs.writeSync(handle, ids.map((id) => `${id}\n`).join(""));
+    fs.fsyncSync(handle);
+    fs.closeSync(handle);
+    handle = null;
     fs.renameSync(tempPath, ledgerPath);
   } catch {
+    if (handle !== null) {
+      try {
+        fs.closeSync(handle);
+      } catch {
+        // Nothing useful to do with a close failure on a temp file we are
+        // about to discard.
+      }
+    }
     try {
       fs.unlinkSync(tempPath);
     } catch {

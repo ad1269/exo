@@ -99,6 +99,39 @@ describe("loadSentLedger", () => {
     },
   );
 
+  // Structural rather than a crash simulation: what makes compaction safe is
+  // that the survivors are flushed to a temp file and renamed over the ledger,
+  // so a crash lands on one whole file or the other. A truncate-and-rewrite
+  // would satisfy every content assertion above and still lose the ledger.
+  it("compacts through a flushed temp file renamed over the ledger", () => {
+    fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+    const ids = Array.from({ length: 1500 }, (_, index) => `cmd-${index}`);
+    fs.writeFileSync(ledgerPath, ids.map((id) => `${id}\n`).join(""));
+
+    const fsyncSpy = vi.spyOn(fs, "fsyncSync");
+    const renameSpy = vi.spyOn(fs, "renameSync");
+    const truncateSpy = vi.spyOn(fs, "truncateSync");
+    try {
+      loadSentLedger(ledgerPath);
+
+      expect(truncateSpy).not.toHaveBeenCalled();
+      expect(renameSpy).toHaveBeenCalledWith(`${ledgerPath}.tmp`, ledgerPath);
+      // The flush has to land before the swap, or the rename can reach disk
+      // pointing at bytes that did not.
+      expect(fsyncSpy).toHaveBeenCalled();
+      expect(Math.max(...fsyncSpy.mock.invocationCallOrder)).toBeLessThan(
+        Math.min(...renameSpy.mock.invocationCallOrder),
+      );
+    } finally {
+      fsyncSpy.mockRestore();
+      renameSpy.mockRestore();
+      truncateSpy.mockRestore();
+    }
+
+    expect(readIds()).toHaveLength(1000);
+    expect(fs.existsSync(`${ledgerPath}.tmp`)).toBe(false);
+  });
+
   it("tolerates blank and whitespace-only lines", () => {
     fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
     fs.writeFileSync(ledgerPath, "cmd-1\n\n   \ncmd-2\n");
