@@ -13,7 +13,7 @@ import {
   stringField,
   writeWorkerEvent,
 } from "../protocol";
-import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
+import { loadSentLedger, sendOnce, sentLedgerPath } from "../sent-ledger";
 import {
   composeMessageText,
   defaultSocketPath,
@@ -131,28 +131,24 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    if (sentLedger.has(command.id)) {
-      writeWorkerEvent({ type: "command_ack", command_id: command.id });
-      continue;
-    }
-    if (command.attachments.length > 0) {
-      throw new Error("agent-cli does not support attachments");
-    }
-    const target = command.target;
-    if (target === null || target === undefined) {
-      throw new Error(
-        "agent-cli send_message requires the target from the inbound message",
-      );
-    }
-    const socket = connections.get(target);
-    if (!socket) {
-      throw new Error(
-        `agent-cli client ${target} is no longer connected; the reply cannot be delivered`,
-      );
-    }
-    sendToClient(socket, { type: "reply", text: command.text });
-    sentLedger.record(command.id);
-    writeWorkerEvent({ type: "command_ack", command_id: command.id });
+    await sendOnce(sentLedger, command.id, () => {
+      if (command.attachments.length > 0) {
+        throw new Error("agent-cli does not support attachments");
+      }
+      const target = command.target;
+      if (target === null || target === undefined) {
+        throw new Error(
+          "agent-cli send_message requires the target from the inbound message",
+        );
+      }
+      const socket = connections.get(target);
+      if (!socket) {
+        throw new Error(
+          `agent-cli client ${target} is no longer connected; the reply cannot be delivered`,
+        );
+      }
+      sendToClient(socket, { type: "reply", text: command.text });
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({ type: "error", message });

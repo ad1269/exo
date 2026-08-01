@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { writeWorkerEvent } from "./protocol";
+
 // The runtime redelivers any outbound message it claimed but never saw acked,
 // so a send whose ack was lost in flight arrives at the worker a second time.
 // The ledger records which command ids this adapter has already handed to the
@@ -13,13 +15,13 @@ import path from "node:path";
 // across adapters would be wrong, not merely wasteful.
 //
 // Honest limits:
-// - A crash between the platform send returning and `record` returning can
-//   still duplicate the message once. That window is milliseconds wide; the
-//   window this closes is the whole worker/loop restart it sits inside.
 // - The ledger is only as durable as the adapter state dir. Wiping worker
 //   state re-opens redelivery for anything still inflight in the runtime.
 // - The ledger says "this id was sent", not "the platform kept it". A send the
 //   platform accepted and later discarded is not resent.
+//
+// `sendOnce` below is the only blessed way to perform a send; the ordering it
+// guarantees is the whole point of the ledger.
 
 const MAX_RETAINED_IDS = 1000;
 // Named so the file describes itself next to session.json and auth/ in the
@@ -45,6 +47,37 @@ export function sentLedgerPath(adapterType: string): string {
       process.env.EXO_ADAPTER_ID ?? "default",
     );
   return path.join(stateDir, LEDGER_FILE_NAME);
+}
+
+// The one blessed way to perform an outbound send. Workers hand over a
+// `deliver` callback and never emit the ack themselves, so the
+// check → deliver → record → ack order has a single home instead of being
+// re-derived correctly in seven worker loops.
+//
+// A known id acks without calling `deliver` at all: the runtime is redelivering
+// something the platform already has, and the ack is what finally clears it
+// from inflight.
+//
+// `deliver` throwing is a real send failure — the id is NOT recorded and no ack
+// is emitted, so the error propagates to the caller's existing nack path and
+// the runtime is free to retry. Each worker reports failures its own way, which
+// is why the nack stays at the call site rather than moving in here.
+//
+// Honest limit: a crash between `deliver` returning and `record` returning can
+// still duplicate the message once. That window is milliseconds wide; the
+// window this closes is the whole worker/loop restart it sits inside.
+export async function sendOnce(
+  ledger: SentLedger,
+  commandId: string,
+  deliver: () => Promise<void> | void,
+): Promise<void> {
+  if (ledger.has(commandId)) {
+    writeWorkerEvent({ type: "command_ack", command_id: commandId });
+    return;
+  }
+  await deliver();
+  ledger.record(commandId);
+  writeWorkerEvent({ type: "command_ack", command_id: commandId });
 }
 
 export function loadSentLedger(ledgerPath: string): SentLedger {

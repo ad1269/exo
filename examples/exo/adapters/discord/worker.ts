@@ -18,7 +18,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
-import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
+import { loadSentLedger, sendOnce, sentLedgerPath } from "../sent-ledger";
 import {
   createResilienceHandlers,
   inboundAttachments,
@@ -166,47 +166,43 @@ try {
     try {
       const command = parseWorkerCommand(JSON.parse(line));
       commandId = command.id;
-      if (sentLedger.has(command.id)) {
-        writeWorkerEvent({ type: "command_ack", command_id: command.id });
-        continue;
-      }
-      const target = command.target ?? defaultChannelId;
-      if (!target) {
-        throw new Error(
-          "Discord send_message requires a target channel id or configured defaultChannelId",
-        );
-      }
-      writeWorkerEvent({
-        type: "lifecycle",
-        name: "send_starting",
-        metadata: {
-          target,
-          attachmentCount: command.attachments.length,
-        },
-      });
-      const files = await discordAttachmentFiles(command.attachments);
-      const contentChunks = splitDiscordContent(command.text);
-      for (const [index, content] of contentChunks.entries()) {
-        await sendDiscordMessage(target, {
-          content,
-          files: index === 0 ? files : [],
+      await sendOnce(sentLedger, command.id, async () => {
+        const target = command.target ?? defaultChannelId;
+        if (!target) {
+          throw new Error(
+            "Discord send_message requires a target channel id or configured defaultChannelId",
+          );
+        }
+        writeWorkerEvent({
+          type: "lifecycle",
+          name: "send_starting",
+          metadata: {
+            target,
+            attachmentCount: command.attachments.length,
+          },
         });
-      }
-      // If this target has an active voice session, also speak the reply. The
-      // text send above doubles as the inspectable transcript of the voice turn.
-      if (voice) {
-        await voice.maybeSpeak(target, command.text);
-      }
-      writeWorkerEvent({
-        type: "lifecycle",
-        name: "send_result",
-        metadata: {
-          target,
-          attachmentCount: command.attachments.length,
-        },
+        const files = await discordAttachmentFiles(command.attachments);
+        const contentChunks = splitDiscordContent(command.text);
+        for (const [index, content] of contentChunks.entries()) {
+          await sendDiscordMessage(target, {
+            content,
+            files: index === 0 ? files : [],
+          });
+        }
+        // If this target has an active voice session, also speak the reply. The
+        // text send above doubles as the inspectable transcript of the voice turn.
+        if (voice) {
+          await voice.maybeSpeak(target, command.text);
+        }
+        writeWorkerEvent({
+          type: "lifecycle",
+          name: "send_result",
+          metadata: {
+            target,
+            attachmentCount: command.attachments.length,
+          },
+        });
       });
-      sentLedger.record(command.id);
-      writeWorkerEvent({ type: "command_ack", command_id: command.id });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportWorkerError(message);

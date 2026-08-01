@@ -17,7 +17,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
-import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
+import { loadSentLedger, sendOnce, sentLedgerPath } from "../sent-ledger";
 
 const config = adapterConfig();
 const trigger = optionalStringField(config, "trigger") ?? "all_messages";
@@ -148,54 +148,51 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    if (sentLedger.has(command.id)) {
-      writeWorkerEvent({ type: "command_ack", command_id: command.id });
-      continue;
-    }
-    if (!command.target) {
-      throw new Error("WhatsApp send_message requires a target chat id");
-    }
-    writeWorkerEvent({
-      type: "lifecycle",
-      name: "send_starting",
-      metadata: {
-        target: command.target,
-        attachmentCount: command.attachments.length,
-      },
+    await sendOnce(sentLedger, command.id, async () => {
+      const target = command.target;
+      if (!target) {
+        throw new Error("WhatsApp send_message requires a target chat id");
+      }
+      writeWorkerEvent({
+        type: "lifecycle",
+        name: "send_starting",
+        metadata: {
+          target,
+          attachmentCount: command.attachments.length,
+        },
+      });
+      if (command.attachments.length === 0) {
+        await sendWhatsAppMessage(target, { text: command.text });
+      } else {
+        let captionUsed = false;
+        const textBeforeMedia = command.attachments.every(
+          (attachment) => !attachmentSupportsCaption(attachment),
+        );
+        if (textBeforeMedia) {
+          await sendWhatsAppMessage(target, { text: command.text });
+          captionUsed = true;
+        }
+        for (const attachment of command.attachments) {
+          const caption: string | null =
+            !captionUsed && attachmentSupportsCaption(attachment)
+              ? command.text
+              : null;
+          captionUsed ||= caption !== null;
+          await sendAttachment(target, attachment, caption);
+        }
+        if (!captionUsed) {
+          await sendWhatsAppMessage(target, { text: command.text });
+        }
+      }
+      writeWorkerEvent({
+        type: "lifecycle",
+        name: "send_result",
+        metadata: {
+          target,
+          attachmentCount: command.attachments.length,
+        },
+      });
     });
-    if (command.attachments.length === 0) {
-      await sendWhatsAppMessage(command.target, { text: command.text });
-    } else {
-      let captionUsed = false;
-      const textBeforeMedia = command.attachments.every(
-        (attachment) => !attachmentSupportsCaption(attachment),
-      );
-      if (textBeforeMedia) {
-        await sendWhatsAppMessage(command.target, { text: command.text });
-        captionUsed = true;
-      }
-      for (const attachment of command.attachments) {
-        const caption: string | null =
-          !captionUsed && attachmentSupportsCaption(attachment)
-            ? command.text
-            : null;
-        captionUsed ||= caption !== null;
-        await sendAttachment(command.target, attachment, caption);
-      }
-      if (!captionUsed) {
-        await sendWhatsAppMessage(command.target, { text: command.text });
-      }
-    }
-    writeWorkerEvent({
-      type: "lifecycle",
-      name: "send_result",
-      metadata: {
-        target: command.target,
-        attachmentCount: command.attachments.length,
-      },
-    });
-    sentLedger.record(command.id);
-    writeWorkerEvent({ type: "command_ack", command_id: command.id });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({

@@ -11,7 +11,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
-import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
+import { loadSentLedger, sendOnce, sentLedgerPath } from "../sent-ledger";
 
 const config = adapterConfig();
 const signalCliCommand = stringArrayOrDefault(
@@ -106,18 +106,18 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    if (sentLedger.has(command.id)) {
-      writeWorkerEvent({ type: "command_ack", command_id: command.id });
-      continue;
-    }
-    if (!command.target) {
-      throw new Error(
-        "Signal send_message requires a target username, uuid, phone number, or group id",
+    await sendOnce(sentLedger, command.id, async () => {
+      if (!command.target) {
+        throw new Error(
+          "Signal send_message requires a target username, uuid, phone number, or group id",
+        );
+      }
+      await sendSignalMessage(
+        command.target,
+        command.text,
+        command.attachments,
       );
-    }
-    await sendSignalMessage(command.target, command.text, command.attachments);
-    sentLedger.record(command.id);
-    writeWorkerEvent({ type: "command_ack", command_id: command.id });
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({

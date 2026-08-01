@@ -3,9 +3,9 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { loadSentLedger, sentLedgerPath } from "./sent-ledger";
+import { loadSentLedger, sendOnce, sentLedgerPath } from "./sent-ledger";
 
 let tempdir: string;
 let ledgerPath: string;
@@ -135,6 +135,127 @@ describe("loadSentLedger", () => {
     const ledger = loadSentLedger(ledgerPath);
     expect(ledger.has("cmd-1")).toBe(false);
     expect(() => ledger.record("cmd-1")).not.toThrow();
+    expect(ledger.has("cmd-1")).toBe(true);
+  });
+});
+
+describe("sendOnce", () => {
+  // Workers never emit the ack themselves, so the events sendOnce writes to
+  // stdout are part of its contract.
+  function captureWorkerEvents(): { events: unknown[]; restore(): void } {
+    const events: unknown[] = [];
+    const spy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk: unknown) => {
+        for (const line of String(chunk).split("\n")) {
+          if (line.trim().length > 0) {
+            events.push(JSON.parse(line));
+          }
+        }
+        return true;
+      });
+    return {
+      events,
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  it("delivers, records, then acks", async () => {
+    const ledger = loadSentLedger(ledgerPath);
+    let delivered = 0;
+    const captured = captureWorkerEvents();
+    try {
+      await sendOnce(ledger, "cmd-1", () => {
+        delivered += 1;
+      });
+    } finally {
+      captured.restore();
+    }
+
+    expect(delivered).toBe(1);
+    expect(ledger.has("cmd-1")).toBe(true);
+    expect(captured.events).toEqual([
+      { type: "command_ack", command_id: "cmd-1" },
+    ]);
+  });
+
+  it("skips deliver for an id the ledger already knows, but still acks", async () => {
+    const ledger = loadSentLedger(ledgerPath);
+    ledger.record("cmd-1");
+    let delivered = 0;
+    const captured = captureWorkerEvents();
+    try {
+      await sendOnce(ledger, "cmd-1", () => {
+        delivered += 1;
+      });
+    } finally {
+      captured.restore();
+    }
+
+    // The platform already has this message; the ack is what clears it from
+    // the runtime's inflight set.
+    expect(delivered).toBe(0);
+    expect(captured.events).toEqual([
+      { type: "command_ack", command_id: "cmd-1" },
+    ]);
+  });
+
+  it("does not record or ack when deliver throws", async () => {
+    const ledger = loadSentLedger(ledgerPath);
+    const captured = captureWorkerEvents();
+    try {
+      await expect(
+        sendOnce(ledger, "cmd-1", () => {
+          throw new Error("platform rejected the send");
+        }),
+      ).rejects.toThrow("platform rejected the send");
+    } finally {
+      captured.restore();
+    }
+
+    // A failed send must stay retryable, and the caller's nack path owns the
+    // reporting.
+    expect(ledger.has("cmd-1")).toBe(false);
+    expect(captured.events).toEqual([]);
+  });
+
+  it("does not record or ack when an async deliver rejects", async () => {
+    const ledger = loadSentLedger(ledgerPath);
+    const captured = captureWorkerEvents();
+    try {
+      await expect(
+        sendOnce(ledger, "cmd-1", async () => {
+          await Promise.resolve();
+          throw new Error("timed out");
+        }),
+      ).rejects.toThrow("timed out");
+    } finally {
+      captured.restore();
+    }
+
+    expect(ledger.has("cmd-1")).toBe(false);
+    expect(captured.events).toEqual([]);
+  });
+
+  it("delivers a retry after an earlier attempt failed", async () => {
+    const ledger = loadSentLedger(ledgerPath);
+    const captured = captureWorkerEvents();
+    try {
+      await expect(
+        sendOnce(ledger, "cmd-1", () => {
+          throw new Error("first attempt failed");
+        }),
+      ).rejects.toThrow("first attempt failed");
+
+      let delivered = 0;
+      await sendOnce(ledger, "cmd-1", () => {
+        delivered += 1;
+      });
+      expect(delivered).toBe(1);
+    } finally {
+      captured.restore();
+    }
+
     expect(ledger.has("cmd-1")).toBe(true);
   });
 });

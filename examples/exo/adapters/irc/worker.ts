@@ -14,7 +14,7 @@ import {
   stringField,
   writeWorkerEvent,
 } from "../protocol";
-import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
+import { loadSentLedger, sendOnce, sentLedgerPath } from "../sent-ledger";
 import {
   isIrcErrorNumeric,
   parseIrcLine,
@@ -162,14 +162,10 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    if (sentLedger.has(command.id)) {
-      writeWorkerEvent({ type: "command_ack", command_id: command.id });
-      continue;
-    }
-    process.stderr.write(`[irc-adapter] sending message to ${channel}\n`);
-    writeIrcCommand(`PRIVMSG ${channel} :${command.text}`);
-    sentLedger.record(command.id);
-    writeWorkerEvent({ type: "command_ack", command_id: command.id });
+    await sendOnce(sentLedger, command.id, () => {
+      process.stderr.write(`[irc-adapter] sending message to ${channel}\n`);
+      writeIrcCommand(`PRIVMSG ${channel} :${command.text}`);
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({
