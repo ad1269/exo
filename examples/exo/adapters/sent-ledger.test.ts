@@ -14,7 +14,7 @@ beforeEach(async () => {
   tempdir = await fsPromises.mkdtemp(
     path.join(os.tmpdir(), "exo-sent-ledger-"),
   );
-  ledgerPath = path.join(tempdir, "state", "sent-ledger");
+  ledgerPath = path.join(tempdir, "state", "sent-ledger.txt");
 });
 
 afterEach(async () => {
@@ -55,7 +55,9 @@ describe("loadSentLedger", () => {
 
   it("does not leak ids between different paths", () => {
     loadSentLedger(ledgerPath).record("cmd-1");
-    const other = loadSentLedger(path.join(tempdir, "other", "sent-ledger"));
+    const other = loadSentLedger(
+      path.join(tempdir, "other", "sent-ledger.txt"),
+    );
     expect(other.has("cmd-1")).toBe(false);
   });
 
@@ -157,7 +159,7 @@ describe("sentLedgerPath", () => {
   it("uses the state dir the runtime exports", () => {
     process.env.EXO_ADAPTER_STATE_DIR = "/var/exo/adapters/irc/main";
     expect(sentLedgerPath("irc")).toBe(
-      "/var/exo/adapters/irc/main/sent-ledger",
+      "/var/exo/adapters/irc/main/sent-ledger.txt",
     );
   });
 
@@ -165,7 +167,7 @@ describe("sentLedgerPath", () => {
     delete process.env.EXO_ADAPTER_STATE_DIR;
     process.env.EXO_ADAPTER_ID = "main";
     expect(sentLedgerPath("slack")).toBe(
-      path.join(".exo", "adapters", "slack", "main", "sent-ledger"),
+      path.join(".exo", "adapters", "slack", "main", "sent-ledger.txt"),
     );
   });
 
@@ -173,7 +175,7 @@ describe("sentLedgerPath", () => {
     delete process.env.EXO_ADAPTER_STATE_DIR;
     delete process.env.EXO_ADAPTER_ID;
     expect(sentLedgerPath("discord")).toBe(
-      path.join(".exo", "adapters", "discord", "default", "sent-ledger"),
+      path.join(".exo", "adapters", "discord", "default", "sent-ledger.txt"),
     );
   });
 });

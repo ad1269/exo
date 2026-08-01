@@ -6,6 +6,12 @@ import path from "node:path";
 // The ledger records which command ids this adapter has already handed to the
 // platform, which turns that redelivery into an ack instead of a second send.
 //
+// This is per-adapter-instance state. It lives in the adapter's own state dir
+// beside that adapter's session and auth material, so two adapters — even two
+// of the same type — never read each other's ledger. Command ids are unique
+// only within the adapter whose outbox minted them, so sharing one ledger
+// across adapters would be wrong, not merely wasteful.
+//
 // Honest limits:
 // - A crash between the platform send returning and `record` returning can
 //   still duplicate the message once. That window is milliseconds wide; the
@@ -16,6 +22,9 @@ import path from "node:path";
 //   platform accepted and later discarded is not resent.
 
 const MAX_RETAINED_IDS = 1000;
+// Named so the file describes itself next to session.json and auth/ in the
+// same state dir: plain line-delimited text, not an opaque blob.
+const LEDGER_FILE_NAME = "sent-ledger.txt";
 
 export type SentLedger = {
   has(commandId: string): boolean;
@@ -35,7 +44,7 @@ export function sentLedgerPath(adapterType: string): string {
       adapterType,
       process.env.EXO_ADAPTER_ID ?? "default",
     );
-  return path.join(stateDir, "sent-ledger");
+  return path.join(stateDir, LEDGER_FILE_NAME);
 }
 
 export function loadSentLedger(ledgerPath: string): SentLedger {
