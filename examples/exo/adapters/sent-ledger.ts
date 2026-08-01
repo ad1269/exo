@@ -68,10 +68,21 @@ export function sentLedgerPath(adapterType: string): string {
 // Honest limit: a crash between `deliver` returning and `record` returning can
 // still duplicate the message once. That window is milliseconds wide; the
 // window this closes is the whole worker/loop restart it sits inside.
+//
+// Which is why `deliver` receives the command id. The ledger is the universal
+// floor: it works on any platform, closes the entire reconnect class of
+// duplicates, and leaves that millisecond residue. A platform-provided
+// idempotency key is the per-platform ceiling: hand the platform a key derived
+// from this id and the residue closes too, because the platform recognizes the
+// retry itself. Only the receiving platform can do that — no amount of
+// sender-side bookkeeping closes a window that spans the network — which is the
+// classic end-to-end argument, and why the key can only be plugged in where a
+// platform offers one. Discord's `nonce` + `enforceNonce` is the worked
+// example; adapters with no such key keep the floor and lose nothing.
 export async function sendOnce(
   ledger: SentLedger,
   commandId: string,
-  deliver: () => Promise<void> | void,
+  deliver: (commandId: string) => Promise<void> | void,
 ): Promise<void> {
   if (ledger.has(commandId)) {
     writeWorkerEvent({
@@ -81,7 +92,7 @@ export async function sendOnce(
     });
     return;
   }
-  await deliver();
+  await deliver(commandId);
   ledger.record(commandId);
   writeWorkerEvent({
     type: "command_ack",

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { AdapterAttachment, WorkerInboundEvent } from "../protocol";
 
 export type DiscordAttachmentLike = {
@@ -7,6 +9,51 @@ export type DiscordAttachmentLike = {
 };
 
 const DISCORD_CONTENT_LIMIT = 2_000;
+// Discord rejects a nonce longer than this.
+const DISCORD_NONCE_LIMIT = 25;
+
+// Discord's idempotency key for message creation. Paired with
+// `enforceNonce: true`, a repeat of the same nonce inside Discord's enforcement
+// window returns the message that already exists instead of posting a second
+// one — which is what closes the crash window the sent-ledger cannot: the gap
+// between the platform accepting a send and the worker recording it.
+//
+// Command ids are UUIDv7 (36 chars), so they cannot be used directly. Hashing
+// keeps the mapping deterministic across worker restarts, which is the whole
+// point: the retry after a crash must derive the same nonce as the attempt that
+// crashed, or Discord sees a different message.
+//
+// `part` distinguishes the chunks of one long message. They are separate
+// creates that must each survive, so a shared nonce would make Discord swallow
+// every chunk after the first.
+export function discordNonce(commandId: string, part: number): string {
+  return createHash("sha256")
+    .update(commandId)
+    .update("\0")
+    .update(String(part))
+    .digest("hex")
+    .slice(0, DISCORD_NONCE_LIMIT);
+}
+
+// One create payload per content chunk, each carrying its own idempotency key.
+// Attachments ride the first chunk only, as they always have.
+export function discordMessagePayloads<File>(
+  commandId: string,
+  chunks: string[],
+  files: readonly File[],
+): {
+  content: string;
+  files: readonly File[];
+  nonce: string;
+  enforceNonce: true;
+}[] {
+  return chunks.map((content, index) => ({
+    content,
+    files: index === 0 ? files : [],
+    nonce: discordNonce(commandId, index),
+    enforceNonce: true,
+  }));
+}
 
 export function splitDiscordContent(
   text: string,

@@ -179,6 +179,21 @@ describe("sendOnce", () => {
     ]);
   });
 
+  it("hands the command id to deliver so it can seed a platform key", async () => {
+    const ledger = loadSentLedger(ledgerPath);
+    const seen: string[] = [];
+    const captured = captureWorkerEvents();
+    try {
+      await sendOnce(ledger, "cmd-1", (commandId) => {
+        seen.push(commandId);
+      });
+    } finally {
+      captured.restore();
+    }
+
+    expect(seen).toEqual(["cmd-1"]);
+  });
+
   it("skips deliver for an id the ledger already knows, but still acks", async () => {
     const ledger = loadSentLedger(ledgerPath);
     ledger.record("cmd-1");

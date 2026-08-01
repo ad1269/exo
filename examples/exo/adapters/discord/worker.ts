@@ -21,6 +21,7 @@ import {
 import { loadSentLedger, sendOnce, sentLedgerPath } from "../sent-ledger";
 import {
   createResilienceHandlers,
+  discordMessagePayloads,
   inboundAttachments,
   splitDiscordContent,
   startConnectionWatchdog,
@@ -166,7 +167,7 @@ try {
     try {
       const command = parseWorkerCommand(JSON.parse(line));
       commandId = command.id;
-      await sendOnce(sentLedger, command.id, async () => {
+      await sendOnce(sentLedger, command.id, async (commandId) => {
         const target = command.target ?? defaultChannelId;
         if (!target) {
           throw new Error(
@@ -183,11 +184,17 @@ try {
         });
         const files = await discordAttachmentFiles(command.attachments);
         const contentChunks = splitDiscordContent(command.text);
-        for (const [index, content] of contentChunks.entries()) {
-          await sendDiscordMessage(target, {
-            content,
-            files: index === 0 ? files : [],
-          });
+        // Each payload carries a nonce, so Discord itself rejects the duplicate
+        // when this send is a retry of one it already accepted. Under
+        // `enforceNonce` a repeat returns the existing message rather than
+        // erroring, so it arrives here as an ordinary success and is recorded
+        // and acked like any other send.
+        for (const payload of discordMessagePayloads(
+          commandId,
+          contentChunks,
+          files,
+        )) {
+          await sendDiscordMessage(target, payload);
         }
         // If this target has an active voice session, also speak the reply. The
         // text send above doubles as the inspectable transcript of the voice turn.
