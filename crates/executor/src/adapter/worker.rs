@@ -74,6 +74,38 @@ pub enum WorkerEvent {
     },
 }
 
+/// Outcome of reading one line of worker stdout.
+enum ParsedWorkerEvent {
+    Event(WorkerEvent),
+    /// Well-formed JSON the kernel does not understand — an event type added by
+    /// a newer worker, or one whose shape does not match this build.
+    Unrecognized(serde_json::Error),
+    /// Not JSON at all. The worker is not speaking the protocol.
+    Malformed(serde_json::Error),
+}
+
+/// Workers are hot-editable TypeScript running against a compiled kernel, and
+/// an agent that edits its own adapter will sometimes emit something this build
+/// has never heard of. That must not be able to kill the worker loop: a
+/// crash-loop takes the adapter down and, with it, the channel the agent would
+/// use to notice and fix the mistake.
+///
+/// So the two failures are separated. A line that is valid JSON but not a
+/// WorkerEvent this kernel knows is skipped and reported — the worker is
+/// speaking the protocol, just a dialect of it. A line that is not JSON at all
+/// stays fatal exactly as before: that worker is not speaking the protocol, and
+/// pretending otherwise would hide a broken adapter behind an endless warning
+/// stream.
+fn parse_worker_event(line: &str) -> ParsedWorkerEvent {
+    match serde_json::from_str::<WorkerEvent>(line) {
+        Ok(event) => ParsedWorkerEvent::Event(event),
+        Err(error) => match serde_json::from_str::<serde::de::IgnoredAny>(line) {
+            Ok(_) => ParsedWorkerEvent::Unrecognized(error),
+            Err(malformed) => ParsedWorkerEvent::Malformed(malformed),
+        },
+    }
+}
+
 pub async fn run_worker_loop<F, Fut, G, OutFut, S, StopFut>(
     adapter_id: &str,
     config: &AdapterConfig,
@@ -152,9 +184,26 @@ where
                     Ok(None) => break Err(anyhow!("adapter worker closed stdout")),
                     Err(error) => break Err(error.into()),
                 };
-                let event = match serde_json::from_str::<WorkerEvent>(&line) {
-                    Ok(event) => event,
-                    Err(error) => {
+                let event = match parse_worker_event(&line) {
+                    ParsedWorkerEvent::Event(event) => event,
+                    ParsedWorkerEvent::Unrecognized(report) => {
+                        tracing::warn!(
+                            adapter_type = %config.adapter_type,
+                            adapter_id = %adapter_id,
+                            line = %line,
+                            error = %report,
+                            "ignoring unrecognized adapter worker event"
+                        );
+                        // Surface it where an operator will find it, but as a
+                        // lifecycle notice rather than an error: the adapter is
+                        // healthy and connected, and `mark_error` would flip its
+                        // lifecycle state on the strength of one stray line.
+                        WorkerEvent::Lifecycle {
+                            name: "unrecognized_event".to_string(),
+                            metadata: serde_json::json!({ "error": report.to_string() }),
+                        }
+                    }
+                    ParsedWorkerEvent::Malformed(error) => {
                         break Err(anyhow::Error::from(error)
                             .context(format!("failed to parse adapter worker event: {line}")));
                     }
@@ -342,6 +391,142 @@ mod tests {
             Some("https://cdn.example/a.png")
         );
         assert_eq!(attachments[0].mime_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn parse_worker_event_separates_unrecognized_from_malformed() {
+        assert!(matches!(
+            parse_worker_event(r#"{"type":"command_ack","command_id":"c"}"#),
+            ParsedWorkerEvent::Event(_)
+        ));
+        // Valid JSON, event type this build has never heard of.
+        assert!(matches!(
+            parse_worker_event(r#"{"type":"from_the_future","note":"hi"}"#),
+            ParsedWorkerEvent::Unrecognized(_)
+        ));
+        // Valid JSON, known tag, shape this build cannot use.
+        assert!(matches!(
+            parse_worker_event(r#"{"type":"message"}"#),
+            ParsedWorkerEvent::Unrecognized(_)
+        ));
+        // Not JSON at all.
+        assert!(matches!(
+            parse_worker_event("not json at all"),
+            ParsedWorkerEvent::Malformed(_)
+        ));
+        assert!(matches!(
+            parse_worker_event(r#"{"type":"message""#),
+            ParsedWorkerEvent::Malformed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unrecognized_events_are_reported_without_killing_the_loop() {
+        let config = AdapterConfig {
+            adapter_type: "test".to_string(),
+            worker_command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                // An event from a worker newer than this kernel, then an
+                // ordinary one. The second must still arrive.
+                concat!(
+                    r#"printf '%s\n' '{"type":"from_the_future","note":"hi"}'; "#,
+                    r#"printf '%s\n' '{"type":"message","target":"t","text":"hi"}'; "#,
+                    "while true; do sleep 1; done"
+                )
+                .to_string(),
+            ],
+            initialization: json!({}),
+            state_dir: None,
+            secret_env: Vec::new(),
+        };
+        let outbound_notify = Arc::new(Notify::new());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let event_seen = Arc::clone(&seen);
+        let stop_seen = Arc::clone(&seen);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_worker_loop(
+                "adapter",
+                &config,
+                Vec::new(),
+                outbound_notify,
+                move |event| {
+                    let seen = Arc::clone(&event_seen);
+                    async move {
+                        let label = match event {
+                            WorkerEvent::Lifecycle { name, .. } => format!("lifecycle:{name}"),
+                            WorkerEvent::Message { text, .. } => format!("message:{text}"),
+                            other => format!("other:{other:?}"),
+                        };
+                        seen.lock().expect("seen poisoned").push(label);
+                        Ok(())
+                    }
+                },
+                || async { Ok(Vec::new()) },
+                move || {
+                    let seen = Arc::clone(&stop_seen);
+                    async move {
+                        Ok(seen
+                            .lock()
+                            .expect("seen poisoned")
+                            .iter()
+                            .any(|label| label.starts_with("message:")))
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("worker loop should not hang");
+
+        assert!(result.is_ok(), "loop should survive an unrecognized event");
+        let seen = seen.lock().expect("seen poisoned").clone();
+        assert_eq!(
+            seen,
+            vec![
+                "lifecycle:unrecognized_event".to_string(),
+                "message:hi".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_still_stops_the_worker() {
+        let config = AdapterConfig {
+            adapter_type: "test".to_string(),
+            worker_command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                concat!(
+                    r#"printf '%s\n' 'not json at all'; "#,
+                    "while true; do sleep 1; done"
+                )
+                .to_string(),
+            ],
+            initialization: json!({}),
+            state_dir: None,
+            secret_env: Vec::new(),
+        };
+        let outbound_notify = Arc::new(Notify::new());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_worker_loop(
+                "adapter",
+                &config,
+                Vec::new(),
+                outbound_notify,
+                |_event| async { Ok(()) },
+                || async { Ok(Vec::new()) },
+                || async { Ok(false) },
+            ),
+        )
+        .await
+        .expect("worker loop should not hang");
+
+        // A worker that is not speaking the protocol still tears the loop down.
+        assert!(result.is_err());
     }
 
     #[tokio::test]
