@@ -56,6 +56,13 @@ pub enum WorkerEvent {
     },
     CommandAck {
         command_id: String,
+        /// What the worker did with the send: "sent" or "deduped". Absent from
+        /// workers that predate the field, hence optional and defaulted. Left
+        /// as a free-form string on purpose — an unrecognized value from a
+        /// newer worker must not fail deserialization of the whole ack.
+        /// Recorded for operators; never acted on.
+        #[serde(default)]
+        disposition: Option<String>,
     },
     CommandNack {
         command_id: String,

@@ -92,11 +92,12 @@ function startWorker(): ChildProcessWithoutNullStreams {
   return worker;
 }
 
-// Resolves on the worker's first `command_ack` for the given id.
+// Resolves with the disposition on the worker's first `command_ack` for the
+// given id.
 function waitForAck(
   worker: ChildProcessWithoutNullStreams,
   commandId: string,
-): Promise<void> {
+): Promise<string | undefined> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`timed out waiting for ack of ${commandId}`));
@@ -115,10 +116,11 @@ function waitForAck(
           type: string;
           command_id?: string;
           message?: string;
+          disposition?: string;
         };
         if (event.type === "command_ack" && event.command_id === commandId) {
           clearTimeout(timer);
-          resolve();
+          resolve(event.disposition);
           return;
         }
         if (event.type === "command_nack" && event.command_id === commandId) {
@@ -168,7 +170,7 @@ describe("IRC worker outbound delivery", () => {
     const first = startWorker();
     await waitForConnection();
     sendCommand(first, "cmd-redelivered", "hello once");
-    await waitForAck(first, "cmd-redelivered");
+    expect(await waitForAck(first, "cmd-redelivered")).toBe("sent");
     expect(privmsgs()).toEqual(["PRIVMSG #exo-test :hello once"]);
 
     // Drop the worker without letting the runtime record the ack, which is
@@ -179,7 +181,8 @@ describe("IRC worker outbound delivery", () => {
     const second = startWorker();
     await waitForConnection();
     sendCommand(second, "cmd-redelivered", "hello once");
-    await waitForAck(second, "cmd-redelivered");
+    // The ack the runtime records says the worker deduped rather than sent.
+    expect(await waitForAck(second, "cmd-redelivered")).toBe("deduped");
 
     // The redelivery is acked from the ledger, so the platform sees one message.
     expect(privmsgs()).toEqual(["PRIVMSG #exo-test :hello once"]);

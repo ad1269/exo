@@ -175,7 +175,7 @@ describe("sendOnce", () => {
     expect(delivered).toBe(1);
     expect(ledger.has("cmd-1")).toBe(true);
     expect(captured.events).toEqual([
-      { type: "command_ack", command_id: "cmd-1" },
+      { type: "command_ack", command_id: "cmd-1", disposition: "sent" },
     ]);
   });
 
@@ -196,7 +196,7 @@ describe("sendOnce", () => {
     // the runtime's inflight set.
     expect(delivered).toBe(0);
     expect(captured.events).toEqual([
-      { type: "command_ack", command_id: "cmd-1" },
+      { type: "command_ack", command_id: "cmd-1", disposition: "deduped" },
     ]);
   });
 

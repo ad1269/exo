@@ -6,6 +6,10 @@ export type WorkerOutboundCommand = {
   attachments: AdapterAttachment[];
 };
 
+// What a worker did with a send. "deduped" means the ledger already held the
+// id and no platform call was made.
+export type CommandAckDisposition = "sent" | "deduped";
+
 export type AdapterAttachment = {
   kind: "image" | "video" | "audio" | "document";
   path?: string | null;
@@ -42,6 +46,7 @@ export type WorkerInboundEvent =
   | {
       type: "command_ack";
       command_id: string;
+      disposition?: CommandAckDisposition;
     }
   | {
       type: "command_nack";

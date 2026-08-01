@@ -17,7 +17,8 @@ use super::store::{AdapterStore, stable_target_key};
 use super::tools::download_attachment;
 use super::types::{
     AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatus,
-    AdapterEventType, AdapterRecord, AdapterTargetConversationRecord, now_ms,
+    AdapterEventType, AdapterOutboundMessageRecord, AdapterRecord, AdapterTargetConversationRecord,
+    now_ms,
 };
 use super::worker::{WorkerCommand, WorkerEvent, run_worker_loop};
 use crate::conversation_events::{
@@ -546,6 +547,23 @@ fn adapter_outbound_notifiers() -> &'static Mutex<HashMap<String, Weak<Notify>>>
     NOTIFIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Worker-reported disposition rides along in the event stream so a reconnect
+/// visibly shows which acks were deduped rather than sent. Recording only —
+/// the delivery state machine treats every ack the same.
+fn delivered_event_summary(
+    message: &AdapterOutboundMessageRecord,
+    disposition: Option<&str>,
+) -> String {
+    let mut summary = format!(
+        "delivered adapter message {} on attempt {}",
+        message.id, message.attempt
+    );
+    if let Some(disposition) = disposition {
+        summary.push_str(&format!(" (worker: {disposition})"));
+    }
+    summary
+}
+
 async fn handle_worker_event(
     store: &AdapterStore,
     agent: &dyn HarnessAgent,
@@ -617,7 +635,10 @@ async fn handle_worker_event(
                 .await?;
             Ok(())
         }
-        WorkerEvent::CommandAck { command_id } => {
+        WorkerEvent::CommandAck {
+            command_id,
+            disposition,
+        } => {
             let delivered = store
                 .acknowledge_outbound_message(&adapter.id, &command_id)
                 .await?;
@@ -626,10 +647,7 @@ async fn handle_worker_event(
                     .record_event(
                         adapter.id.clone(),
                         AdapterEventType::Outbound,
-                        format!(
-                            "delivered adapter message {} on attempt {}",
-                            delivered.id, delivered.attempt
-                        ),
+                        delivered_event_summary(&delivered, disposition.as_deref()),
                     )
                     .await?;
             }
@@ -1155,6 +1173,73 @@ mod tests {
 
     fn test_adapter_config() -> AdapterConfig {
         config_with_scope(None)
+    }
+
+    fn outbound_message(attempt: u32) -> AdapterOutboundMessageRecord {
+        AdapterOutboundMessageRecord {
+            id: "message-1".to_string(),
+            adapter_id: "adapter-1".to_string(),
+            created_at_ms: 0,
+            text: "hello".to_string(),
+            target: Some("#channel".to_string()),
+            attachments: Vec::new(),
+            status: AdapterDeliveryStatus::InFlight,
+            attempt,
+            updated_at_ms: 0,
+            completed_at_ms: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn delivered_summary_records_worker_disposition() {
+        let message = outbound_message(2);
+        assert_eq!(
+            delivered_event_summary(&message, Some("deduped")),
+            "delivered adapter message message-1 on attempt 2 (worker: deduped)"
+        );
+        assert_eq!(
+            delivered_event_summary(&message, Some("sent")),
+            "delivered adapter message message-1 on attempt 2 (worker: sent)"
+        );
+    }
+
+    #[test]
+    fn delivered_summary_omits_disposition_from_older_workers() {
+        assert_eq!(
+            delivered_event_summary(&outbound_message(1), None),
+            "delivered adapter message message-1 on attempt 1"
+        );
+    }
+
+    #[test]
+    fn command_ack_without_disposition_still_deserializes() {
+        // An older worker emits no disposition; the ack must still parse.
+        let event: WorkerEvent =
+            serde_json::from_str(r#"{"type":"command_ack","command_id":"message-1"}"#).unwrap();
+        let WorkerEvent::CommandAck {
+            command_id,
+            disposition,
+        } = event
+        else {
+            panic!("expected a command_ack");
+        };
+        assert_eq!(command_id, "message-1");
+        assert_eq!(disposition, None);
+    }
+
+    #[test]
+    fn command_ack_keeps_an_unrecognized_disposition() {
+        // A newer worker may report a disposition this build does not know;
+        // recording it beats failing the whole ack.
+        let event: WorkerEvent = serde_json::from_str(
+            r#"{"type":"command_ack","command_id":"message-1","disposition":"coalesced"}"#,
+        )
+        .unwrap();
+        let WorkerEvent::CommandAck { disposition, .. } = event else {
+            panic!("expected a command_ack");
+        };
+        assert_eq!(disposition.as_deref(), Some("coalesced"));
     }
 
     #[test]

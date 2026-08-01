@@ -56,7 +56,9 @@ export function sentLedgerPath(adapterType: string): string {
 //
 // A known id acks without calling `deliver` at all: the runtime is redelivering
 // something the platform already has, and the ack is what finally clears it
-// from inflight.
+// from inflight. Every ack carries a `disposition`, which is the observability
+// of this fix: without it a suppressed redelivery is indistinguishable from a
+// fresh send in the event stream.
 //
 // `deliver` throwing is a real send failure — the id is NOT recorded and no ack
 // is emitted, so the error propagates to the caller's existing nack path and
@@ -72,12 +74,20 @@ export async function sendOnce(
   deliver: () => Promise<void> | void,
 ): Promise<void> {
   if (ledger.has(commandId)) {
-    writeWorkerEvent({ type: "command_ack", command_id: commandId });
+    writeWorkerEvent({
+      type: "command_ack",
+      command_id: commandId,
+      disposition: "deduped",
+    });
     return;
   }
   await deliver();
   ledger.record(commandId);
-  writeWorkerEvent({ type: "command_ack", command_id: commandId });
+  writeWorkerEvent({
+    type: "command_ack",
+    command_id: commandId,
+    disposition: "sent",
+  });
 }
 
 export function loadSentLedger(ledgerPath: string): SentLedger {
