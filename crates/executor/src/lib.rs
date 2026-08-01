@@ -1,5 +1,6 @@
 mod adapter;
 mod agent_sandbox;
+pub mod attention;
 mod basic;
 #[cfg(test)]
 mod basic_tests;
