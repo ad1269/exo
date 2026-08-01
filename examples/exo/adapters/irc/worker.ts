@@ -14,6 +14,7 @@ import {
   stringField,
   writeWorkerEvent,
 } from "../protocol";
+import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
 import {
   isIrcErrorNumeric,
   parseIrcLine,
@@ -32,6 +33,7 @@ const channel = stringField(config, "channel");
 const password =
   process.env.EXO_IRC_PASSWORD ?? optionalStringField(config, "password");
 const trigger = stringField(config, "trigger") as IrcTriggerPolicy;
+const sentLedger = loadSentLedger(sentLedgerPath("irc"));
 
 if (port <= 0 || !Number.isInteger(port)) {
   throw new Error("IRC port must be a positive integer");
@@ -160,8 +162,13 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
+    if (sentLedger.has(command.id)) {
+      writeWorkerEvent({ type: "command_ack", command_id: command.id });
+      continue;
+    }
     process.stderr.write(`[irc-adapter] sending message to ${channel}\n`);
     writeIrcCommand(`PRIVMSG ${channel} :${command.text}`);
+    sentLedger.record(command.id);
     writeWorkerEvent({ type: "command_ack", command_id: command.id });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

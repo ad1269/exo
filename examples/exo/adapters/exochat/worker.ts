@@ -9,6 +9,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
 
 const config = adapterConfig();
 const baseUrl = normalizeBaseUrl(
@@ -26,6 +27,7 @@ const stateDir =
   process.env.EXO_ADAPTER_STATE_DIR ??
   `.exo/adapters/exochat/${process.env.EXO_ADAPTER_ID ?? "default"}`;
 const sessionPath = path.join(stateDir, "session.json");
+const sentLedger = loadSentLedger(sentLedgerPath("exochat"));
 const role = "agent";
 const SEND_TIMEOUT_MS = 30_000;
 
@@ -70,6 +72,10 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
+    if (sentLedger.has(command.id)) {
+      writeWorkerEvent({ type: "command_ack", command_id: command.id });
+      continue;
+    }
     const target = command.target ?? session.channelId;
     if (target !== session.channelId) {
       throw new Error(
@@ -97,6 +103,7 @@ for await (const line of input) {
       name: "send_result",
       metadata: { target },
     });
+    sentLedger.record(command.id);
     writeWorkerEvent({ type: "command_ack", command_id: command.id });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

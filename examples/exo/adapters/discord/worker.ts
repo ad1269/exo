@@ -18,6 +18,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
 import {
   createResilienceHandlers,
   inboundAttachments,
@@ -40,6 +41,7 @@ const defaultChannelId = optionalStringField(config, "defaultChannelId");
 const allowedChannels = stringArrayOrNull(config.allowedChannels);
 const allowBots = config.allowBots === true;
 const voiceEnabled = config.voice === true;
+const sentLedger = loadSentLedger(sentLedgerPath("discord"));
 if (trigger !== "all_messages" && trigger !== "mentions_only") {
   throw new Error("Discord trigger must be all_messages or mentions_only");
 }
@@ -164,6 +166,10 @@ try {
     try {
       const command = parseWorkerCommand(JSON.parse(line));
       commandId = command.id;
+      if (sentLedger.has(command.id)) {
+        writeWorkerEvent({ type: "command_ack", command_id: command.id });
+        continue;
+      }
       const target = command.target ?? defaultChannelId;
       if (!target) {
         throw new Error(
@@ -199,6 +205,7 @@ try {
           attachmentCount: command.attachments.length,
         },
       });
+      sentLedger.record(command.id);
       writeWorkerEvent({ type: "command_ack", command_id: command.id });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

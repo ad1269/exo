@@ -9,6 +9,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const SEND_TIMEOUT_MS = 60_000;
@@ -34,6 +35,7 @@ const allowedChannels = stringArrayOrNull(config.allowedChannels);
 const allowBots = config.allowBots === true;
 const threadReplies = config.threadReplies !== false;
 const progressMode = slackProgressMode(config.progressMode);
+const sentLedger = loadSentLedger(sentLedgerPath("slack"));
 if (trigger !== "all_messages" && trigger !== "mentions_only") {
   throw new Error("Slack trigger must be all_messages or mentions_only");
 }
@@ -181,6 +183,10 @@ async function readCommands(): Promise<void> {
     try {
       const command = parseWorkerCommand(JSON.parse(line));
       commandId = command.id;
+      if (sentLedger.has(command.id)) {
+        writeWorkerEvent({ type: "command_ack", command_id: command.id });
+        continue;
+      }
       if (command.attachments.length > 0) {
         throw new Error("Slack adapter supports text-only messages for now");
       }
@@ -248,6 +254,7 @@ async function readCommands(): Promise<void> {
           slackWarning: result.warning,
         },
       });
+      sentLedger.record(command.id);
       writeWorkerEvent({ type: "command_ack", command_id: command.id });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

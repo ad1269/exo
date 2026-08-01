@@ -13,6 +13,7 @@ import {
   stringField,
   writeWorkerEvent,
 } from "../protocol";
+import { loadSentLedger, sentLedgerPath } from "../sent-ledger";
 import {
   composeMessageText,
   defaultSocketPath,
@@ -25,6 +26,7 @@ const socketPath =
 const mountRoot = stringField(config, "mountRoot");
 const mountPath = stringField(config, "mountPath");
 const sender = os.userInfo().username;
+const sentLedger = loadSentLedger(sentLedgerPath("agent-cli"));
 
 if (!mountRoot.startsWith("/")) {
   throw new Error("agent-cli mountRoot must be an absolute host path");
@@ -129,6 +131,10 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
+    if (sentLedger.has(command.id)) {
+      writeWorkerEvent({ type: "command_ack", command_id: command.id });
+      continue;
+    }
     if (command.attachments.length > 0) {
       throw new Error("agent-cli does not support attachments");
     }
@@ -145,6 +151,7 @@ for await (const line of input) {
       );
     }
     sendToClient(socket, { type: "reply", text: command.text });
+    sentLedger.record(command.id);
     writeWorkerEvent({ type: "command_ack", command_id: command.id });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
