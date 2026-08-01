@@ -41,6 +41,8 @@ mod backend_tests;
 #[cfg(test)]
 mod dispatcher_tests;
 #[cfg(test)]
+mod integration_tests;
+#[cfg(test)]
 mod producers_tests;
 
 pub use backend::{AttentionBackend, InMemoryAttentionBackend};
