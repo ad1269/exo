@@ -142,6 +142,7 @@ impl AdapterStore {
         remove_dir_if_exists(self.delivered_dir(adapter_id)).await?;
         remove_dir_if_exists(self.failed_dir(adapter_id)).await?;
         remove_dir_if_exists(self.inbound_seen_dir(adapter_id)).await?;
+        remove_dir_if_exists(self.outbound_sent_dir(adapter_id)).await?;
         remove_dir_if_exists(self.target_conversations_dir(adapter_id)).await?;
         Ok(Some(adapter))
     }
@@ -508,6 +509,40 @@ impl AdapterStore {
                 format!("failed to create inbound seen marker {}", path.display())
             }),
         }
+    }
+
+    /// Where a worker records the outbound messages it has handed to its
+    /// platform. Exported to the worker at spawn; the kernel only ever reads
+    /// whether a marker exists.
+    pub fn outbound_sent_dir(&self, adapter_id: &str) -> PathBuf {
+        self.root.join("outbound-sent").join(adapter_id)
+    }
+
+    /// A stat that fails for any reason other than absence reads as no marker.
+    /// The same broken disk that stops a worker writing markers would otherwise
+    /// make every read of one an error, and an error on this path costs more
+    /// than the duplicate send it prevents.
+    pub async fn has_outbound_sent(&self, adapter_id: &str, message_id: &str) -> Result<bool> {
+        let path = self.outbound_sent_path(adapter_id, message_id);
+        match fs::metadata(&path).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => {
+                tracing::warn!(
+                    adapter_id,
+                    message_id,
+                    path = %path.display(),
+                    %error,
+                    "failed to stat an outbound sent marker; reading it as absent"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn outbound_sent_path(&self, adapter_id: &str, message_id: &str) -> PathBuf {
+        self.outbound_sent_dir(adapter_id)
+            .join(format!("{message_id}.json"))
     }
 
     fn adapters_dir(&self) -> PathBuf {
@@ -1024,5 +1059,74 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn reads_sent_markers_written_by_a_worker() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+
+        assert!(!store.has_outbound_sent("adapter", "message").await.unwrap());
+        write_sent_marker(&store, "adapter", "message").await;
+        assert!(store.has_outbound_sent("adapter", "message").await.unwrap());
+        assert!(!store.has_outbound_sent("adapter", "other").await.unwrap());
+        assert!(!store.has_outbound_sent("other", "message").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_marker_path_reads_as_no_marker() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        // A file where the per-adapter marker directory belongs, so the stat
+        // fails with something other than "not found".
+        fs::write(tempdir.path().join("outbound-sent"), "not a directory")
+            .await
+            .unwrap();
+
+        // Erroring here would fail every attempt until the message gave up
+        // undelivered, which costs more than the duplicate send it prevents.
+        assert!(!store.has_outbound_sent("adapter", "message").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deleting_an_adapter_clears_its_sent_markers() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = store
+            .create_adapter(NewAdapter {
+                agent_id: "agent".to_string(),
+                conversation_id: "conversation".to_string(),
+                name: "irc".to_string(),
+                source: AdapterSource::Library,
+                config: AdapterConfig {
+                    adapter_type: "irc".to_string(),
+                    worker_command: vec!["node".to_string(), "irc.js".to_string()],
+                    initialization: serde_json::json!({}),
+                    state_dir: None,
+                    secret_env: Vec::new(),
+                },
+            })
+            .await
+            .unwrap();
+        write_sent_marker(&store, &adapter.id, "message").await;
+
+        store.delete_adapter(&adapter.id).await.unwrap();
+
+        assert!(
+            !store
+                .has_outbound_sent(&adapter.id, "message")
+                .await
+                .unwrap()
+        );
+        assert!(!store.outbound_sent_dir(&adapter.id).exists());
+    }
+
+    // Markers are written by the worker, never by the kernel.
+    async fn write_sent_marker(store: &AdapterStore, adapter_id: &str, message_id: &str) {
+        let dir = store.outbound_sent_dir(adapter_id);
+        fs::create_dir_all(&dir).await.unwrap();
+        fs::write(dir.join(format!("{message_id}.json")), "{}")
+            .await
+            .unwrap();
     }
 }

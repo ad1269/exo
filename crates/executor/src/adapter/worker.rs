@@ -71,6 +71,7 @@ pub async fn run_worker_loop<F, Fut, G, OutFut, S, StopFut>(
     adapter_id: &str,
     config: &AdapterConfig,
     secret_env: Vec<(String, String)>,
+    sent_dir: &Path,
     outbound_notify: Arc<Notify>,
     on_event: F,
     take_outbound_messages: G,
@@ -90,7 +91,25 @@ where
         worker_command = ?config.worker_command,
         "starting adapter worker"
     );
-    let mut command = worker_command(adapter_id, config, secret_env);
+    // The worker writes into this directory on every send, so it should exist
+    // before the worker does. Failing to create it is not a reason to refuse to
+    // start: the worker's own marker writes fail open, and the ack audit
+    // reports the gap that leaves.
+    if let Err(error) = tokio::fs::create_dir_all(sent_dir).await {
+        tracing::warn!(
+            adapter_id = %adapter_id,
+            sent_dir = %sent_dir.display(),
+            %error,
+            "failed to create the adapter sent marker directory"
+        );
+    }
+    // The kernel reads these markers back through its own path, so hand the
+    // worker the resolved one rather than something a differing cwd would
+    // resolve elsewhere.
+    let sent_dir = tokio::fs::canonicalize(sent_dir)
+        .await
+        .unwrap_or_else(|_| sent_dir.to_path_buf());
+    let mut command = worker_command(adapter_id, config, secret_env, &sent_dir);
     // Workers can spawn their own children (pnpm -> tsx -> node). Put the
     // whole tree in its own process group so shutdown can signal everything;
     // kill_on_drop alone would only reach the direct child and orphan the
@@ -247,6 +266,7 @@ fn worker_command(
     adapter_id: &str,
     config: &AdapterConfig,
     secret_env: Vec<(String, String)>,
+    sent_dir: &Path,
 ) -> Command {
     let args = &config.worker_command;
     let mut command = Command::new(&args[0]);
@@ -254,6 +274,7 @@ fn worker_command(
     command.env("EXO_ADAPTER_ID", adapter_id);
     command.env("EXO_ADAPTER_TYPE", &config.adapter_type);
     command.env("EXO_ADAPTER_STATE_DIR", state_dir(adapter_id, config));
+    command.env("EXO_ADAPTER_SENT_DIR", sent_dir);
     command.env(
         "EXO_ADAPTER_CONFIG",
         serde_json::to_string(&config.initialization).expect("adapter initialization is JSON"),
@@ -351,11 +372,13 @@ mod tests {
             secret_env: Vec::new(),
         };
         let outbound_notify = Arc::new(Notify::new());
+        let sent_dir = TempDir::new().unwrap();
 
         run_worker_loop(
             "adapter",
             &config,
             Vec::new(),
+            sent_dir.path(),
             outbound_notify,
             |_event| async { Ok(()) },
             || async { Ok(Vec::new()) },
@@ -363,6 +386,92 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // Runs a worker that reports the sent dir it was given and then idles,
+    // stopping the loop as soon as that report arrives.
+    async fn exported_sent_dir(sent_dir: &Path) -> Vec<String> {
+        let config = AdapterConfig {
+            adapter_type: "test".to_string(),
+            worker_command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                concat!(
+                    r#"printf '{"type":"lifecycle","name":"sent_dir","metadata":{"path":"%s"}}\n' "$EXO_ADAPTER_SENT_DIR"; "#,
+                    "while true; do sleep 1; done"
+                )
+                .to_string(),
+            ],
+            initialization: json!({}),
+            state_dir: None,
+            secret_env: Vec::new(),
+        };
+        let outbound_notify = Arc::new(Notify::new());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let event_seen = Arc::clone(&seen);
+        let stop_seen = Arc::clone(&seen);
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_worker_loop(
+                "adapter",
+                &config,
+                Vec::new(),
+                sent_dir,
+                outbound_notify,
+                move |event| {
+                    let seen = Arc::clone(&event_seen);
+                    async move {
+                        if let WorkerEvent::Lifecycle { metadata, .. } = event
+                            && let Some(path) = metadata.get("path").and_then(|path| path.as_str())
+                        {
+                            seen.lock().expect("seen poisoned").push(path.to_string());
+                        }
+                        Ok(())
+                    }
+                },
+                || async { Ok(Vec::new()) },
+                move || {
+                    let seen = Arc::clone(&stop_seen);
+                    async move { Ok(!seen.lock().expect("seen poisoned").is_empty()) }
+                },
+            ),
+        )
+        .await
+        .expect("worker loop should not hang")
+        .unwrap();
+
+        seen.lock().expect("seen poisoned").clone()
+    }
+
+    #[tokio::test]
+    async fn spawn_creates_and_exports_the_sent_marker_dir() {
+        let tempdir = TempDir::new().unwrap();
+        let sent_dir = tempdir.path().join("outbound-sent").join("adapter");
+
+        let exported = exported_sent_dir(&sent_dir).await;
+
+        assert!(sent_dir.is_dir());
+        // Resolved, so the worker writes markers where the kernel reads them
+        // even when the two disagree about the cwd.
+        let resolved = tokio::fs::canonicalize(&sent_dir).await.unwrap();
+        assert_eq!(exported, vec![resolved.to_string_lossy().into_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_sent_marker_dir_that_cannot_be_created_still_starts_the_worker() {
+        let tempdir = TempDir::new().unwrap();
+        // A file where the parent directory belongs, so create_dir_all fails.
+        let blocked = tempdir.path().join("outbound-sent");
+        tokio::fs::write(&blocked, "not a directory").await.unwrap();
+        let sent_dir = blocked.join("adapter");
+
+        let exported = exported_sent_dir(&sent_dir).await;
+
+        // Refusing to start would take the adapter's inbound side down too,
+        // over a directory only the outbound dedupe needs.
+        assert!(!sent_dir.exists());
+        assert_eq!(exported, vec![sent_dir.to_string_lossy().into_owned()]);
     }
 
     #[tokio::test]
@@ -382,6 +491,7 @@ mod tests {
         };
         let outbound_notify = Arc::new(Notify::new());
         let stop_checks = Arc::new(AtomicUsize::new(0));
+        let sent_dir = TempDir::new().unwrap();
 
         // The stop request arrives only after a backlog has built up. Without
         // latching, the loop would keep accepting new events and never observe
@@ -392,6 +502,7 @@ mod tests {
                 "adapter",
                 &config,
                 Vec::new(),
+                sent_dir.path(),
                 outbound_notify,
                 |_event| async {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -413,6 +524,7 @@ mod tests {
     async fn dispatches_outbound_commands_while_event_handler_is_busy() {
         let tempdir = TempDir::new().unwrap();
         let output_path = tempdir.path().join("command.json");
+        let sent_dir = tempdir.path().join("sent");
         let config = AdapterConfig {
             adapter_type: "test".to_string(),
             worker_command: vec![
@@ -441,6 +553,7 @@ mod tests {
                     "OUTPUT_PATH".to_string(),
                     output_path.to_string_lossy().into_owned(),
                 )],
+                &sent_dir,
                 outbound_notify_for_worker,
                 move |event| {
                     let event_started_tx = event_started_tx.take();

@@ -53,8 +53,11 @@ Layout:
 .exo/adapters/adapters/<adapter-id>.json
 .exo/adapters/events/<adapter-id>/<event-id>.json
 .exo/adapters/outbox/<adapter-id>/<message-id>.json
+.exo/adapters/outbound-sent/<adapter-id>/<message-id>.json
 .exo/adapters/<adapter-type>/<adapter-id>/...
 ```
+
+`outbound-sent/` holds one marker per message the worker has handed to its platform. The worker writes them; the kernel only reads whether one exists.
 
 Adapter records and event records stay in the store. Larger, conversation-visible payloads are written as conversation artifacts by the runtime.
 
@@ -129,6 +132,7 @@ Workers receive configuration via environment:
 - `EXO_ADAPTER_ID`
 - `EXO_ADAPTER_TYPE`
 - `EXO_ADAPTER_STATE_DIR`
+- `EXO_ADAPTER_SENT_DIR`: where to write sent markers. The TypeScript helper throws at startup without it, so a worker run by hand fails rather than sending undeduped.
 - `EXO_ADAPTER_CONFIG`
 - protocol-specific secret env vars, such as `EXO_IRC_PASSWORD`
 

@@ -442,10 +442,12 @@ async fn run_adapter_loop(
     let outbound_adapter_id = adapter.id.clone();
     let stop_store = store.clone();
     let stop_adapter_id = adapter.id.clone();
+    let sent_dir = store.outbound_sent_dir(&adapter.id);
     run_worker_loop(
         &adapter.id,
         &config,
         secret_env,
+        &sent_dir,
         Arc::clone(&outbound_notifier.notify),
         move |event| {
             let store = event_store.clone();
