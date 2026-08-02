@@ -360,6 +360,18 @@ impl AdapterStore {
         else {
             return Ok(None);
         };
+        // A last attempt that fails on a message the worker already sent is a
+        // crash after delivery, not a delivery failure: the marker says the
+        // platform has it. `failed/` is terminal, so burying it there would be
+        // a claim nothing ever revisits. Only reachable at the cap — below it
+        // the message is requeued and the dispatch check catches the marker.
+        if message.attempt >= MAX_DELIVERY_ATTEMPTS
+            && self.has_outbound_sent(adapter_id, message_id).await?
+        {
+            return self
+                .acknowledge_outbound_message(adapter_id, message_id)
+                .await;
+        }
         message.last_error = Some(error.into());
         message.updated_at_ms = now_ms();
         remove_file_if_exists(self.inflight_path(adapter_id, message_id)).await?;
@@ -377,26 +389,36 @@ impl AdapterStore {
         Ok(Some(message))
     }
 
-    pub async fn requeue_outbound_message(&self, adapter_id: &str, message_id: &str) -> Result<()> {
+    pub async fn requeue_outbound_message(
+        &self,
+        adapter_id: &str,
+        message_id: &str,
+    ) -> Result<Option<AdapterOutboundMessageRecord>> {
         self.nack_outbound_message(
             adapter_id,
             message_id,
             "worker stopped before acknowledging command",
         )
-        .await?;
-        Ok(())
+        .await
     }
 
-    pub async fn requeue_inflight_messages(&self, adapter_id: &str) -> Result<()> {
+    /// Returns how each in-flight message settled. Almost always queued for
+    /// another attempt, but one whose last attempt died after the worker sent
+    /// it comes back delivered, which the caller has to report.
+    pub async fn requeue_inflight_messages(
+        &self,
+        adapter_id: &str,
+    ) -> Result<Vec<AdapterOutboundMessageRecord>> {
         let inflight_dir = self.inflight_dir(adapter_id);
         match fs::metadata(&inflight_dir).await {
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         }
         let mut entries = fs::read_dir(&inflight_dir).await.with_context(|| {
             format!("failed to read adapter inflight directory {inflight_dir:?}")
         })?;
+        let mut settled = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -405,10 +427,14 @@ impl AdapterStore {
             let Some(message_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            self.requeue_outbound_message(adapter_id, message_id)
-                .await?;
+            if let Some(message) = self
+                .requeue_outbound_message(adapter_id, message_id)
+                .await?
+            {
+                settled.push(message);
+            }
         }
-        Ok(())
+        Ok(settled)
     }
 
     pub async fn get_target_conversation(
@@ -521,7 +547,7 @@ impl AdapterStore {
     /// A stat that fails for any reason other than absence reads as no marker.
     /// The same broken disk that stops a worker writing markers would otherwise
     /// make every read of one an error, and an error on this path costs more
-    /// than the duplicate send it prevents.
+    /// than the duplicate send it is trying to prevent.
     pub async fn has_outbound_sent(&self, adapter_id: &str, message_id: &str) -> Result<bool> {
         let path = self.outbound_sent_path(adapter_id, message_id);
         match fs::metadata(&path).await {
@@ -1086,6 +1112,90 @@ mod tests {
         // Erroring here would fail every attempt until the message gave up
         // undelivered, which costs more than the duplicate send it prevents.
         assert!(!store.has_outbound_sent("adapter", "message").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_marked_message_is_delivered_rather_than_failed_at_the_attempt_cap() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let message = store
+            .enqueue_outbound_message("adapter".to_string(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+        for _ in 1..MAX_DELIVERY_ATTEMPTS {
+            store.claim_outbound_messages("adapter").await.unwrap();
+            store
+                .nack_outbound_message("adapter", &message.id, "failed")
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // The last attempt reaches the platform and then the worker dies
+        // between writing the marker and acking.
+        store.claim_outbound_messages("adapter").await.unwrap();
+        write_sent_marker(&store, "adapter", &message.id).await;
+
+        let settled = store
+            .nack_outbound_message("adapter", &message.id, "worker exited")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(settled.status, AdapterDeliveryStatus::Delivered);
+        assert_eq!(settled.attempt, MAX_DELIVERY_ATTEMPTS);
+        assert!(settled.last_error.is_none());
+        assert!(store.delivered_path("adapter", &message.id).exists());
+        assert!(!store.failed_path("adapter", &message.id).exists());
+    }
+
+    #[tokio::test]
+    async fn an_unmarked_message_still_fails_at_the_attempt_cap() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let message = store
+            .enqueue_outbound_message("adapter".to_string(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+        for _ in 0..MAX_DELIVERY_ATTEMPTS {
+            store.claim_outbound_messages("adapter").await.unwrap();
+            store
+                .nack_outbound_message("adapter", &message.id, "failed")
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        assert!(store.failed_path("adapter", &message.id).exists());
+        assert!(!store.delivered_path("adapter", &message.id).exists());
+    }
+
+    #[tokio::test]
+    async fn requeueing_reports_a_marked_message_at_the_cap_as_delivered() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let message = store
+            .enqueue_outbound_message("adapter".to_string(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+        for _ in 1..MAX_DELIVERY_ATTEMPTS {
+            store.claim_outbound_messages("adapter").await.unwrap();
+            store
+                .nack_outbound_message("adapter", &message.id, "failed")
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // Claimed for the last time, sent, marked — then the runner restarts
+        // and finds it still in flight.
+        store.claim_outbound_messages("adapter").await.unwrap();
+        write_sent_marker(&store, "adapter", &message.id).await;
+
+        let settled = store.requeue_inflight_messages("adapter").await.unwrap();
+
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].id, message.id);
+        assert_eq!(settled[0].status, AdapterDeliveryStatus::Delivered);
+        assert!(store.delivered_path("adapter", &message.id).exists());
     }
 
     #[tokio::test]
