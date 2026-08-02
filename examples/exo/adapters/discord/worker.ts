@@ -18,6 +18,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { sendOnce, sentMarkerDir } from "../sent-marker";
 import {
   createResilienceHandlers,
   inboundAttachments,
@@ -40,6 +41,7 @@ const defaultChannelId = optionalStringField(config, "defaultChannelId");
 const allowedChannels = stringArrayOrNull(config.allowedChannels);
 const allowBots = config.allowBots === true;
 const voiceEnabled = config.voice === true;
+const sentDir = sentMarkerDir();
 if (trigger !== "all_messages" && trigger !== "mentions_only") {
   throw new Error("Discord trigger must be all_messages or mentions_only");
 }
@@ -164,42 +166,43 @@ try {
     try {
       const command = parseWorkerCommand(JSON.parse(line));
       commandId = command.id;
-      const target = command.target ?? defaultChannelId;
-      if (!target) {
-        throw new Error(
-          "Discord send_message requires a target channel id or configured defaultChannelId",
-        );
-      }
-      writeWorkerEvent({
-        type: "lifecycle",
-        name: "send_starting",
-        metadata: {
-          target,
-          attachmentCount: command.attachments.length,
-        },
-      });
-      const files = await discordAttachmentFiles(command.attachments);
-      const contentChunks = splitDiscordContent(command.text);
-      for (const [index, content] of contentChunks.entries()) {
-        await sendDiscordMessage(target, {
-          content,
-          files: index === 0 ? files : [],
+      await sendOnce(sentDir, command.id, async () => {
+        const target = command.target ?? defaultChannelId;
+        if (!target) {
+          throw new Error(
+            "Discord send_message requires a target channel id or configured defaultChannelId",
+          );
+        }
+        writeWorkerEvent({
+          type: "lifecycle",
+          name: "send_starting",
+          metadata: {
+            target,
+            attachmentCount: command.attachments.length,
+          },
         });
-      }
-      // If this target has an active voice session, also speak the reply. The
-      // text send above doubles as the inspectable transcript of the voice turn.
-      if (voice) {
-        await voice.maybeSpeak(target, command.text);
-      }
-      writeWorkerEvent({
-        type: "lifecycle",
-        name: "send_result",
-        metadata: {
-          target,
-          attachmentCount: command.attachments.length,
-        },
+        const files = await discordAttachmentFiles(command.attachments);
+        const contentChunks = splitDiscordContent(command.text);
+        for (const [index, content] of contentChunks.entries()) {
+          await sendDiscordMessage(target, {
+            content,
+            files: index === 0 ? files : [],
+          });
+        }
+        // If this target has an active voice session, also speak the reply. The
+        // text send above doubles as the inspectable transcript of the voice turn.
+        if (voice) {
+          await voice.maybeSpeak(target, command.text);
+        }
+        writeWorkerEvent({
+          type: "lifecycle",
+          name: "send_result",
+          metadata: {
+            target,
+            attachmentCount: command.attachments.length,
+          },
+        });
       });
-      writeWorkerEvent({ type: "command_ack", command_id: command.id });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportWorkerError(message);

@@ -13,6 +13,7 @@ import {
   stringField,
   writeWorkerEvent,
 } from "../protocol";
+import { sendOnce, sentMarkerDir } from "../sent-marker";
 import {
   composeMessageText,
   defaultSocketPath,
@@ -25,6 +26,7 @@ const socketPath =
 const mountRoot = stringField(config, "mountRoot");
 const mountPath = stringField(config, "mountPath");
 const sender = os.userInfo().username;
+const sentDir = sentMarkerDir();
 
 if (!mountRoot.startsWith("/")) {
   throw new Error("agent-cli mountRoot must be an absolute host path");
@@ -129,23 +131,24 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    if (command.attachments.length > 0) {
-      throw new Error("agent-cli does not support attachments");
-    }
-    const target = command.target;
-    if (target === null || target === undefined) {
-      throw new Error(
-        "agent-cli send_message requires the target from the inbound message",
-      );
-    }
-    const socket = connections.get(target);
-    if (!socket) {
-      throw new Error(
-        `agent-cli client ${target} is no longer connected; the reply cannot be delivered`,
-      );
-    }
-    sendToClient(socket, { type: "reply", text: command.text });
-    writeWorkerEvent({ type: "command_ack", command_id: command.id });
+    await sendOnce(sentDir, command.id, () => {
+      if (command.attachments.length > 0) {
+        throw new Error("agent-cli does not support attachments");
+      }
+      const target = command.target;
+      if (target === null || target === undefined) {
+        throw new Error(
+          "agent-cli send_message requires the target from the inbound message",
+        );
+      }
+      const socket = connections.get(target);
+      if (!socket) {
+        throw new Error(
+          `agent-cli client ${target} is no longer connected; the reply cannot be delivered`,
+        );
+      }
+      sendToClient(socket, { type: "reply", text: command.text });
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({ type: "error", message });

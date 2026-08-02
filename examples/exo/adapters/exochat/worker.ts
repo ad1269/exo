@@ -9,6 +9,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { sendOnce, sentMarkerDir } from "../sent-marker";
 
 const config = adapterConfig();
 const baseUrl = normalizeBaseUrl(
@@ -26,6 +27,7 @@ const stateDir =
   process.env.EXO_ADAPTER_STATE_DIR ??
   `.exo/adapters/exochat/${process.env.EXO_ADAPTER_ID ?? "default"}`;
 const sessionPath = path.join(stateDir, "session.json");
+const sentDir = sentMarkerDir();
 const role = "agent";
 const SEND_TIMEOUT_MS = 30_000;
 
@@ -70,34 +72,35 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    const target = command.target ?? session.channelId;
-    if (target !== session.channelId) {
-      throw new Error(
-        `ExoChat target must be null or the session channel id ${session.channelId}`,
-      );
-    }
-    writeWorkerEvent({
-      type: "lifecycle",
-      name: "send_starting",
-      metadata: { target },
+    await sendOnce(sentDir, command.id, async () => {
+      const target = command.target ?? session.channelId;
+      if (target !== session.channelId) {
+        throw new Error(
+          `ExoChat target must be null or the session channel id ${session.channelId}`,
+        );
+      }
+      writeWorkerEvent({
+        type: "lifecycle",
+        name: "send_starting",
+        metadata: { target },
+      });
+      if (command.attachments.length > 0) {
+        throw new Error(
+          "ExoChat is text-only right now; use another adapter for attachments",
+        );
+      }
+      await sendFrame({
+        type: "chat",
+        id: command.id,
+        text: command.text,
+        createdAt: Date.now(),
+      });
+      writeWorkerEvent({
+        type: "lifecycle",
+        name: "send_result",
+        metadata: { target },
+      });
     });
-    if (command.attachments.length > 0) {
-      throw new Error(
-        "ExoChat is text-only right now; use another adapter for attachments",
-      );
-    }
-    await sendFrame({
-      type: "chat",
-      id: command.id,
-      text: command.text,
-      createdAt: Date.now(),
-    });
-    writeWorkerEvent({
-      type: "lifecycle",
-      name: "send_result",
-      metadata: { target },
-    });
-    writeWorkerEvent({ type: "command_ack", command_id: command.id });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({ type: "error", message });
