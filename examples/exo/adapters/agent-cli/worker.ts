@@ -84,7 +84,7 @@ const server = net.createServer((socket) => {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      sendToClient(socket, { type: "error", message });
+      sendToClientDetached(socket, { type: "error", message });
     }
   });
 });
@@ -131,7 +131,7 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    await sendOnce(sentDir, command.id, () => {
+    await sendOnce(sentDir, command.id, async () => {
       if (command.attachments.length > 0) {
         throw new Error("agent-cli does not support attachments");
       }
@@ -147,7 +147,7 @@ for await (const line of input) {
           `agent-cli client ${target} is no longer connected; the reply cannot be delivered`,
         );
       }
-      sendToClient(socket, { type: "reply", text: command.text });
+      await sendToClient(socket, { type: "reply", text: command.text });
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -162,13 +162,22 @@ for await (const line of input) {
   }
 }
 
-function sendToClient(socket: net.Socket, payload: object): void {
-  socket.write(`${JSON.stringify(payload)}\n`, (error) => {
-    if (error) {
-      writeWorkerEvent({
-        type: "error",
-        message: `agent-cli client write error: ${error.message}`,
-      });
-    }
+// Resolves once the socket has accepted the bytes; the detached variant below
+// is for the writes that have no command to nack.
+function sendToClient(socket: net.Socket, payload: object): Promise<void> {
+  return new Promise((resolve, reject) => {
+    socket.write(`${JSON.stringify(payload)}\n`, (error) => {
+      if (error) {
+        reject(new Error(`agent-cli client write error: ${error.message}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function sendToClientDetached(socket: net.Socket, payload: object): void {
+  sendToClient(socket, payload).catch((error: Error) => {
+    writeWorkerEvent({ type: "error", message: error.message });
   });
 }
