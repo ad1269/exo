@@ -60,10 +60,10 @@ socket.on("close", () => {
 
 await onceConnected(socket);
 if (password) {
-  writeIrcCommand(`PASS ${password}`);
+  writeIrcCommandDetached(`PASS ${password}`);
 }
-writeIrcCommand(`NICK ${nick}`);
-writeIrcCommand(`USER ${username} 0 * :${realname}`);
+writeIrcCommandDetached(`NICK ${nick}`);
+writeIrcCommandDetached(`USER ${username} 0 * :${realname}`);
 
 const lines = readline.createInterface({
   input: socket,
@@ -83,7 +83,7 @@ let joined = false;
 lines.on("line", (raw) => {
   const line = parseIrcLine(raw);
   if (line.type === "ping") {
-    writeIrcCommand(`PONG :${line.token}`);
+    writeIrcCommandDetached(`PONG :${line.token}`);
     return;
   }
   if (isIrcErrorNumeric(raw)) {
@@ -92,7 +92,7 @@ lines.on("line", (raw) => {
   }
   if (!registered && raw.includes(` 001 ${nick} `)) {
     registered = true;
-    writeIrcCommand(`JOIN ${channel}`);
+    writeIrcCommandDetached(`JOIN ${channel}`);
     return;
   }
   if (!joined && isJoinConfirmation(raw)) {
@@ -162,9 +162,9 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    await sendOnce(sentDir, command.id, () => {
+    await sendOnce(sentDir, command.id, async () => {
       process.stderr.write(`[irc-adapter] sending message to ${channel}\n`);
-      writeIrcCommand(`PRIVMSG ${channel} :${command.text}`);
+      await writeIrcCommand(`PRIVMSG ${channel} :${command.text}`);
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -193,14 +193,23 @@ function onceConnected(socket: net.Socket): Promise<void> {
   });
 }
 
-function writeIrcCommand(command: string): void {
-  socket.write(`${command}\r\n`, (error) => {
-    if (error) {
-      writeWorkerEvent({
-        type: "error",
-        message: `IRC socket write error: ${error.message}`,
-      });
-    }
+// Resolves once the socket has accepted the bytes; the detached variant below
+// is for the writes that have no command to nack.
+function writeIrcCommand(command: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    socket.write(`${command}\r\n`, (error) => {
+      if (error) {
+        reject(new Error(`IRC socket write error: ${error.message}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function writeIrcCommandDetached(command: string): void {
+  writeIrcCommand(command).catch((error: Error) => {
+    writeWorkerEvent({ type: "error", message: error.message });
   });
 }
 

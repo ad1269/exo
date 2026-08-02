@@ -10,6 +10,7 @@ import {
   writeWorkerEvent,
 } from "../protocol";
 import { sendOnce, sentMarkerDir } from "../sent-marker";
+import { flushSocket } from "./exochat";
 
 const config = adapterConfig();
 const baseUrl = normalizeBaseUrl(
@@ -248,8 +249,10 @@ async function sendFrame(frame: Record<string, unknown>): Promise<void> {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     throw new Error("ExoChat WebSocket is not open");
   }
+  const open = socket;
   const envelope = encryptRelayFrame(frame, ++seq);
-  socket.send(JSON.stringify(envelope));
+  open.send(JSON.stringify(envelope));
+  await flushSocket(open, SEND_TIMEOUT_MS);
 }
 
 function encryptRelayFrame(
