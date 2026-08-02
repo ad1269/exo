@@ -17,7 +17,8 @@ use super::store::{AdapterStore, stable_target_key};
 use super::tools::download_attachment;
 use super::types::{
     AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatus,
-    AdapterEventType, AdapterRecord, AdapterTargetConversationRecord, now_ms,
+    AdapterEventType, AdapterOutboundMessageRecord, AdapterRecord, AdapterTargetConversationRecord,
+    now_ms,
 };
 use super::worker::{WorkerCommand, WorkerEvent, run_worker_loop};
 use crate::conversation_events::{
@@ -429,7 +430,13 @@ async fn run_adapter_loop(
 ) -> Result<()> {
     let agent = require_agent(harness.as_ref(), &adapter).await?;
     let conversation = require_conversation(agent.as_ref(), &adapter).await?;
-    store.requeue_inflight_messages(&adapter.id).await?;
+    // A message whose last attempt died after the worker had already sent it
+    // comes back delivered rather than requeued, and nothing else would say so.
+    for message in store.requeue_inflight_messages(&adapter.id).await? {
+        if message.status == AdapterDeliveryStatus::Delivered {
+            record_marker_delivery(store, &adapter.id, &message).await?;
+        }
+    }
     let config = adapter.config.clone();
     let secret_env = worker_secret_env(agent.exoharness_handle().as_ref(), &config).await?;
     let outbound_notifier = register_adapter_outbound_notifier(&adapter.id);
@@ -438,6 +445,8 @@ async fn run_adapter_loop(
     let event_agent = std::sync::Arc::clone(&agent);
     let event_conversation = std::sync::Arc::clone(&conversation);
     let event_config = config.clone();
+    // Scoped to this worker run, so a restarted worker gets a fresh report.
+    let event_ack_audit = Arc::new(AtomicBool::new(false));
     let outbound_store = store.clone();
     let outbound_adapter_id = adapter.id.clone();
     let stop_store = store.clone();
@@ -455,6 +464,7 @@ async fn run_adapter_loop(
             let agent = std::sync::Arc::clone(&event_agent);
             let conversation = std::sync::Arc::clone(&event_conversation);
             let config = event_config.clone();
+            let ack_audit = Arc::clone(&event_ack_audit);
             async move {
                 handle_worker_event(
                     &store,
@@ -462,6 +472,7 @@ async fn run_adapter_loop(
                     conversation,
                     &adapter,
                     &config,
+                    &ack_audit,
                     event,
                 )
                 .await
@@ -470,19 +481,7 @@ async fn run_adapter_loop(
         move || {
             let store = outbound_store.clone();
             let adapter_id = outbound_adapter_id.clone();
-            async move {
-                Ok(store
-                    .claim_outbound_messages(&adapter_id)
-                    .await?
-                    .into_iter()
-                    .map(|message| WorkerCommand::SendMessage {
-                        id: message.id,
-                        target: message.target,
-                        text: message.text,
-                        attachments: message.attachments,
-                    })
-                    .collect())
-            }
+            async move { claim_dispatchable_commands(&store, &adapter_id).await }
         },
         move || {
             let store = stop_store.clone();
@@ -548,12 +547,202 @@ fn adapter_outbound_notifiers() -> &'static Mutex<HashMap<String, Weak<Notify>>>
     NOTIFIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How a message reached the delivered state, which is the difference the
+/// event stream has to show: a redelivery the kernel suppressed looks exactly
+/// like a fresh send otherwise.
+enum DeliveredVia {
+    WorkerAck,
+    SentMarker,
+}
+
+fn delivered_event_summary(
+    message: &AdapterOutboundMessageRecord,
+    delivered_via: DeliveredVia,
+) -> String {
+    let mut summary = format!(
+        "delivered adapter message {} on attempt {}",
+        message.id, message.attempt
+    );
+    if matches!(delivered_via, DeliveredVia::SentMarker) {
+        summary.push_str(" (deduped: sent marker present)");
+    }
+    summary
+}
+
+/// Claim the outbox, then drop anything the worker already sent. The runtime
+/// redelivers messages it claimed but never saw acked, so a send whose ack was
+/// lost in flight comes back around; the marker is what tells the two apart.
+/// Dispatching it again would post the message twice.
+async fn claim_dispatchable_commands(
+    store: &AdapterStore,
+    adapter_id: &str,
+) -> Result<Vec<WorkerCommand>> {
+    let mut commands = Vec::new();
+    for message in store.claim_outbound_messages(adapter_id).await? {
+        if store.has_outbound_sent(adapter_id, &message.id).await? {
+            mark_delivered(store, adapter_id, &message.id, DeliveredVia::SentMarker).await?;
+            continue;
+        }
+        commands.push(WorkerCommand::SendMessage {
+            id: message.id,
+            target: message.target,
+            text: message.text,
+            attachments: message.attachments,
+        });
+    }
+    Ok(commands)
+}
+
+async fn mark_delivered(
+    store: &AdapterStore,
+    adapter_id: &str,
+    message_id: &str,
+    delivered_via: DeliveredVia,
+) -> Result<()> {
+    let Some(delivered) = store
+        .acknowledge_outbound_message(adapter_id, message_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    store
+        .record_event(
+            adapter_id.to_string(),
+            AdapterEventType::Outbound,
+            delivered_event_summary(&delivered, delivered_via),
+        )
+        .await?;
+    Ok(())
+}
+
+/// For a message the store has already moved to delivered on the strength of
+/// its marker, so only the event is left to write.
+async fn record_marker_delivery(
+    store: &AdapterStore,
+    adapter_id: &str,
+    message: &AdapterOutboundMessageRecord,
+) -> Result<()> {
+    store
+        .record_event(
+            adapter_id.to_string(),
+            AdapterEventType::Outbound,
+            delivered_event_summary(message, DeliveredVia::SentMarker),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Delivery is recorded first and the audit strictly after. The audit writes to
+/// the same store whose failure it is reporting, and an error escaping ahead of
+/// the acknowledgement would leave a message that the platform already has back
+/// in the queue — the duplicate the marker exists to prevent.
+async fn handle_command_ack(
+    store: &AdapterStore,
+    adapter: &AdapterRecord,
+    config: &AdapterConfig,
+    reported: &AtomicBool,
+    command_id: &str,
+) -> Result<()> {
+    mark_delivered(store, &adapter.id, command_id, DeliveredVia::WorkerAck).await?;
+    if let Err(error) =
+        audit_ack_without_sent_marker(store, adapter, config, reported, command_id).await
+    {
+        tracing::warn!(
+            adapter_id = %adapter.id,
+            command_id = %command_id,
+            %error,
+            "failed to audit an adapter ack against its sent marker"
+        );
+    }
+    Ok(())
+}
+
+async fn handle_command_nack(
+    store: &AdapterStore,
+    adapter: &AdapterRecord,
+    command_id: &str,
+    message: &str,
+) -> Result<()> {
+    let Some(delivery) = store
+        .nack_outbound_message(&adapter.id, command_id, message)
+        .await?
+    else {
+        return Ok(());
+    };
+    // At the attempt cap the marker outranks the nack: the worker had already
+    // handed this to the platform, so the store delivered the message instead
+    // of burying it in failed/.
+    if delivery.status == AdapterDeliveryStatus::Delivered {
+        return record_marker_delivery(store, &adapter.id, &delivery).await;
+    }
+    let terminal = delivery.status == AdapterDeliveryStatus::Failed;
+    let summary = format!(
+        "{} adapter message {} after attempt {}: {}",
+        if terminal { "failed" } else { "retrying" },
+        delivery.id,
+        delivery.attempt,
+        message
+    );
+    if terminal {
+        store.mark_error(&adapter.id, summary.clone()).await?;
+    }
+    store
+        .record_event(adapter.id.clone(), AdapterEventType::Error, summary)
+        .await?;
+    if !terminal {
+        notify_adapter_outbound(&adapter.id);
+    }
+    Ok(())
+}
+
+/// A worker that acks without leaving a marker breaks the dedupe the kernel
+/// depends on, so the redelivery it was supposed to suppress will send twice.
+/// Reported rather than fatal: an adapter whose disk is full still needs to
+/// deliver messages. Recorded on the first occurrence only — a worker that
+/// never writes markers has nothing to add on its second message, and the
+/// event store is not the place to learn that once per send.
+async fn audit_ack_without_sent_marker(
+    store: &AdapterStore,
+    adapter: &AdapterRecord,
+    config: &AdapterConfig,
+    reported: &AtomicBool,
+    command_id: &str,
+) -> Result<()> {
+    if store.has_outbound_sent(&adapter.id, command_id).await? {
+        return Ok(());
+    }
+    if reported.swap(true, Ordering::SeqCst) {
+        tracing::debug!(
+            adapter_type = %config.adapter_type,
+            adapter_id = %adapter.id,
+            command_id = %command_id,
+            "adapter worker acked another send without recording a sent marker"
+        );
+        return Ok(());
+    }
+    tracing::warn!(
+        adapter_type = %config.adapter_type,
+        adapter_id = %adapter.id,
+        command_id = %command_id,
+        "adapter worker acked a send without recording a sent marker"
+    );
+    store
+        .record_event(
+            adapter.id.clone(),
+            AdapterEventType::Lifecycle,
+            format!("adapter message {command_id} was acked without a sent marker"),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn handle_worker_event(
     store: &AdapterStore,
     agent: &dyn HarnessAgent,
     root_conversation: Arc<dyn HarnessConversation>,
     adapter: &AdapterRecord,
     config: &AdapterConfig,
+    ack_audit: &AtomicBool,
     event: WorkerEvent,
 ) -> Result<()> {
     match event {
@@ -620,52 +809,12 @@ async fn handle_worker_event(
             Ok(())
         }
         WorkerEvent::CommandAck { command_id } => {
-            let delivered = store
-                .acknowledge_outbound_message(&adapter.id, &command_id)
-                .await?;
-            if let Some(delivered) = delivered {
-                store
-                    .record_event(
-                        adapter.id.clone(),
-                        AdapterEventType::Outbound,
-                        format!(
-                            "delivered adapter message {} on attempt {}",
-                            delivered.id, delivered.attempt
-                        ),
-                    )
-                    .await?;
-            }
-            Ok(())
+            handle_command_ack(store, adapter, config, ack_audit, &command_id).await
         }
         WorkerEvent::CommandNack {
             command_id,
             message,
-        } => {
-            let delivery = store
-                .nack_outbound_message(&adapter.id, &command_id, message.clone())
-                .await?;
-            let Some(delivery) = delivery else {
-                return Ok(());
-            };
-            let terminal = delivery.status == AdapterDeliveryStatus::Failed;
-            let summary = format!(
-                "{} adapter message {} after attempt {}: {}",
-                if terminal { "failed" } else { "retrying" },
-                delivery.id,
-                delivery.attempt,
-                message
-            );
-            if terminal {
-                store.mark_error(&adapter.id, summary.clone()).await?;
-            }
-            store
-                .record_event(adapter.id.clone(), AdapterEventType::Error, summary)
-                .await?;
-            if !terminal {
-                notify_adapter_outbound(&adapter.id);
-            }
-            Ok(())
-        }
+        } => handle_command_nack(store, adapter, &command_id, &message).await,
         WorkerEvent::Disconnected { reason } => {
             record_worker_lifecycle(
                 store,
@@ -1080,6 +1229,7 @@ async fn resolve_secret_id(agent: &dyn AgentHandle, reference: &str) -> Result<S
 
 #[cfg(test)]
 mod tests {
+    use super::super::store::MAX_DELIVERY_ATTEMPTS;
     use super::*;
 
     #[test]
@@ -1274,5 +1424,257 @@ mod tests {
         assert!(prompt.contains("do not use DM to bypass safety policy"));
         assert!(prompt.contains("Only call send_adapter_message"));
         assert!(prompt.contains("If no response is needed, do nothing"));
+    }
+
+    async fn write_sent_marker(store: &AdapterStore, adapter_id: &str, message_id: &str) {
+        let dir = store.outbound_sent_dir(adapter_id);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(format!("{message_id}.json")), "{}")
+            .await
+            .unwrap();
+    }
+
+    async fn event_summaries(
+        store: &AdapterStore,
+        adapter_id: &str,
+        event_type: AdapterEventType,
+    ) -> Vec<String> {
+        store
+            .list_events(adapter_id, Some(event_type), None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.summary)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_and_delivers_messages_the_worker_already_sent() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let already_sent = store
+            .enqueue_outbound_message(
+                "adapter-1".to_string(),
+                "sent".to_string(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let fresh = store
+            .enqueue_outbound_message(
+                "adapter-1".to_string(),
+                "fresh".to_string(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        write_sent_marker(&store, "adapter-1", &already_sent.id).await;
+
+        let commands = claim_dispatchable_commands(&store, "adapter-1")
+            .await
+            .unwrap();
+
+        let WorkerCommand::SendMessage { id, text, .. } =
+            commands.first().expect("the fresh message should dispatch");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(id, &fresh.id);
+        assert_eq!(text, "fresh");
+        assert_eq!(
+            event_summaries(&store, "adapter-1", AdapterEventType::Outbound).await,
+            vec![format!(
+                "delivered adapter message {} on attempt 1 (deduped: sent marker present)",
+                already_sent.id
+            )],
+        );
+        // Delivered, not requeued: the suppressed message never comes back.
+        assert!(
+            claim_dispatchable_commands(&store, "adapter-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_without_a_sent_marker_is_reported() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = test_adapter_record();
+        let config = adapter.config.clone();
+        let reported = AtomicBool::new(false);
+
+        audit_ack_without_sent_marker(&store, &adapter, &config, &reported, "message-1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            event_summaries(&store, &adapter.id, AdapterEventType::Lifecycle).await,
+            vec!["adapter message message-1 was acked without a sent marker".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_with_a_sent_marker_is_not_reported() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = test_adapter_record();
+        let config = adapter.config.clone();
+        let reported = AtomicBool::new(false);
+        write_sent_marker(&store, &adapter.id, "message-1").await;
+
+        audit_ack_without_sent_marker(&store, &adapter, &config, &reported, "message-1")
+            .await
+            .unwrap();
+
+        assert!(
+            event_summaries(&store, &adapter.id, AdapterEventType::Lifecycle)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unmarked_acks_are_reported_once_per_worker_run() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = test_adapter_record();
+        let config = adapter.config.clone();
+        let reported = AtomicBool::new(false);
+
+        for message in ["message-1", "message-2", "message-3"] {
+            audit_ack_without_sent_marker(&store, &adapter, &config, &reported, message)
+                .await
+                .unwrap();
+        }
+
+        // A worker that never records markers would otherwise append an event
+        // for every message it will ever send.
+        assert_eq!(
+            event_summaries(&store, &adapter.id, AdapterEventType::Lifecycle).await,
+            vec!["adapter message message-1 was acked without a sent marker".to_string()],
+        );
+
+        // The next worker run starts with fresh state and reports again.
+        let restarted = AtomicBool::new(false);
+        audit_ack_without_sent_marker(&store, &adapter, &config, &restarted, "message-4")
+            .await
+            .unwrap();
+        assert_eq!(
+            event_summaries(&store, &adapter.id, AdapterEventType::Lifecycle)
+                .await
+                .len(),
+            2,
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_delivers_the_message_before_it_audits_it() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = test_adapter_record();
+        let config = adapter.config.clone();
+        let message = store
+            .enqueue_outbound_message(adapter.id.clone(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+        store.claim_outbound_messages(&adapter.id).await.unwrap();
+        // The disk that stopped the worker writing its marker also breaks
+        // every store write that follows.
+        tokio::fs::write(tempdir.path().join("events"), "not a directory")
+            .await
+            .unwrap();
+
+        let acked = handle_command_ack(
+            &store,
+            &adapter,
+            &config,
+            &AtomicBool::new(false),
+            &message.id,
+        )
+        .await;
+
+        // Auditing first would have failed with the message still in flight,
+        // and the requeue on restart would then send it a second time.
+        assert!(
+            store
+                .requeue_inflight_messages(&adapter.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the ack must be recorded before anything that can fail: {acked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_survives_an_audit_that_cannot_record() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = test_adapter_record();
+        let config = adapter.config.clone();
+        // A late ack for a message the dedupe already delivered: nothing left
+        // to acknowledge, so only the audit writes.
+        tokio::fs::write(tempdir.path().join("events"), "not a directory")
+            .await
+            .unwrap();
+
+        handle_command_ack(
+            &store,
+            &adapter,
+            &config,
+            &AtomicBool::new(false),
+            "message-1",
+        )
+        .await
+        .expect("an audit that cannot record must not take the worker loop down");
+    }
+
+    #[tokio::test]
+    async fn a_nack_at_the_attempt_cap_delivers_a_marked_message() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = test_adapter_record();
+        let message = store
+            .enqueue_outbound_message(adapter.id.clone(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+        for _ in 1..MAX_DELIVERY_ATTEMPTS {
+            store.claim_outbound_messages(&adapter.id).await.unwrap();
+            store
+                .nack_outbound_message(&adapter.id, &message.id, "failed")
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // The last attempt lands on the platform, then the worker dies between
+        // marking it and acking, and the runner nacks what it never saw acked.
+        store.claim_outbound_messages(&adapter.id).await.unwrap();
+        write_sent_marker(&store, &adapter.id, &message.id).await;
+
+        handle_command_nack(&store, &adapter, &message.id, "worker exited")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            event_summaries(&store, &adapter.id, AdapterEventType::Outbound).await,
+            vec![format!(
+                "delivered adapter message {} on attempt {MAX_DELIVERY_ATTEMPTS} (deduped: sent marker present)",
+                message.id
+            )],
+        );
+        // A delivered message is never an adapter error, and it is gone from
+        // the queue rather than waiting for another attempt.
+        assert!(
+            event_summaries(&store, &adapter.id, AdapterEventType::Error)
+                .await
+                .is_empty()
+        );
+        assert!(
+            claim_dispatchable_commands(&store, &adapter.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
