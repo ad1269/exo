@@ -11,6 +11,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { sendOnce, sentMarkerDir } from "../sent-marker";
 
 const config = adapterConfig();
 const signalCliCommand = stringArrayOrDefault(
@@ -27,6 +28,7 @@ const configuredAccount = optionalStringField(config, "account");
 const deviceName = optionalStringField(config, "deviceName") ?? "Exo";
 const trigger = optionalStringField(config, "trigger") ?? "all_messages";
 const allowedContacts = stringArrayOrNull(config.allowedContacts);
+const sentDir = sentMarkerDir();
 if (trigger !== "all_messages" && trigger !== "contacts_only") {
   throw new Error("Signal trigger must be all_messages or contacts_only");
 }
@@ -104,13 +106,18 @@ for await (const line of input) {
   try {
     const command = parseWorkerCommand(JSON.parse(line));
     commandId = command.id;
-    if (!command.target) {
-      throw new Error(
-        "Signal send_message requires a target username, uuid, phone number, or group id",
+    await sendOnce(sentDir, command.id, async () => {
+      if (!command.target) {
+        throw new Error(
+          "Signal send_message requires a target username, uuid, phone number, or group id",
+        );
+      }
+      await sendSignalMessage(
+        command.target,
+        command.text,
+        command.attachments,
       );
-    }
-    await sendSignalMessage(command.target, command.text, command.attachments);
-    writeWorkerEvent({ type: "command_ack", command_id: command.id });
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({

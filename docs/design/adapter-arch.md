@@ -164,9 +164,9 @@ crates/executor/src/conversation_wakeup.rs
 2. TypeScript tool definitions pass the request to the host tool runtime.
 3. `runtime.rs` writes an outbound artifact into the conversation.
 4. `AdapterStore` writes an outbox record.
-5. The adapter runner drains the outbox once per second.
+5. The adapter runner drains the outbox once per second, marking any message that already has a sent marker delivered instead of dispatching it again.
 6. The host writes a `send_message` JSONL command to the worker stdin.
-7. The worker sends through the external protocol.
+7. The worker sends through the external protocol, writes the sent marker, then acks.
 
 This avoids short-lived reconnects for every outbound message.
 

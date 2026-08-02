@@ -9,6 +9,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { sendOnce, sentMarkerDir } from "../sent-marker";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const SEND_TIMEOUT_MS = 60_000;
@@ -34,6 +35,7 @@ const allowedChannels = stringArrayOrNull(config.allowedChannels);
 const allowBots = config.allowBots === true;
 const threadReplies = config.threadReplies !== false;
 const progressMode = slackProgressMode(config.progressMode);
+const sentDir = sentMarkerDir();
 if (trigger !== "all_messages" && trigger !== "mentions_only") {
   throw new Error("Slack trigger must be all_messages or mentions_only");
 }
@@ -181,74 +183,78 @@ async function readCommands(): Promise<void> {
     try {
       const command = parseWorkerCommand(JSON.parse(line));
       commandId = command.id;
-      if (command.attachments.length > 0) {
-        throw new Error("Slack adapter supports text-only messages for now");
-      }
-      const target = command.target ?? defaultChannelId;
-      if (!target) {
-        throw new Error(
-          "Slack send_message requires a target or configured defaultChannelId",
-        );
-      }
-      const destination = await slackDestination(target);
-      writeWorkerEvent({
-        type: "lifecycle",
-        name: "send_starting",
-        metadata: {
-          target,
-          channel: destination.channel,
-          threadTs: destination.threadTs,
-          dmUserId: destination.dmUserId,
-          progressPending: activeProgress.has(target),
-        },
-      });
-      let sendMode: "message" | "stream" | "update" = "message";
-      let result: SlackPostMessageResult | null = null;
-      try {
-        const progressResult = await finishSlackProgress(target, command.text);
-        if (progressResult !== null) {
-          sendMode = progressResult.mode;
-          result = progressResult.result;
+      await sendOnce(sentDir, command.id, async () => {
+        if (command.attachments.length > 0) {
+          throw new Error("Slack adapter supports text-only messages for now");
         }
-      } catch (error) {
-        const progressError =
-          error instanceof Error ? error.message : String(error);
+        const target = command.target ?? defaultChannelId;
+        if (!target) {
+          throw new Error(
+            "Slack send_message requires a target or configured defaultChannelId",
+          );
+        }
+        const destination = await slackDestination(target);
         writeWorkerEvent({
           type: "lifecycle",
-          name: "send_progress_fallback",
+          name: "send_starting",
           metadata: {
             target,
             channel: destination.channel,
             threadTs: destination.threadTs,
-            error: progressError,
+            dmUserId: destination.dmUserId,
+            progressPending: activeProgress.has(target),
           },
         });
-      }
-      if (result === null) {
-        result = await postSlackMessage(destination, command.text);
-      }
-      if (destination.threadTs !== null) {
-        activeThreads.add(
-          slackThreadKey(destination.channel, destination.threadTs),
-        );
-      }
-      writeWorkerEvent({
-        type: "lifecycle",
-        name: "send_result",
-        metadata: {
-          target,
-          channel: destination.channel,
-          threadTs: destination.threadTs,
-          dmUserId: destination.dmUserId,
-          sendMode,
-          slackChannel: result.channel,
-          slackTs: result.ts,
-          slackMessageTs: result.messageTs,
-          slackText: result.text,
-          slackWarning: result.warning,
-        },
+        let sendMode: "message" | "stream" | "update" = "message";
+        let result: SlackPostMessageResult | null = null;
+        try {
+          const progressResult = await finishSlackProgress(
+            target,
+            command.text,
+          );
+          if (progressResult !== null) {
+            sendMode = progressResult.mode;
+            result = progressResult.result;
+          }
+        } catch (error) {
+          const progressError =
+            error instanceof Error ? error.message : String(error);
+          writeWorkerEvent({
+            type: "lifecycle",
+            name: "send_progress_fallback",
+            metadata: {
+              target,
+              channel: destination.channel,
+              threadTs: destination.threadTs,
+              error: progressError,
+            },
+          });
+        }
+        if (result === null) {
+          result = await postSlackMessage(destination, command.text);
+        }
+        if (destination.threadTs !== null) {
+          activeThreads.add(
+            slackThreadKey(destination.channel, destination.threadTs),
+          );
+        }
+        writeWorkerEvent({
+          type: "lifecycle",
+          name: "send_result",
+          metadata: {
+            target,
+            channel: destination.channel,
+            threadTs: destination.threadTs,
+            dmUserId: destination.dmUserId,
+            sendMode,
+            slackChannel: result.channel,
+            slackTs: result.ts,
+            slackMessageTs: result.messageTs,
+            slackText: result.text,
+            slackWarning: result.warning,
+          },
+        });
       });
-      writeWorkerEvent({ type: "command_ack", command_id: command.id });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportWorkerError(message);
