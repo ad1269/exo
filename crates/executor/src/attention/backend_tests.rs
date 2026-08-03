@@ -1,28 +1,47 @@
 use exoharness::Uuid7;
 use serde_json::Value;
+use tempfile::TempDir;
 
 use super::{
-    Attention, AttentionBackend, InMemoryAttentionBackend, InboxItem, ProducerKind, ProducerRef,
+    Attention, AttentionBackend, FileAttentionBackend, InMemoryAttentionBackend, InboxItem,
+    ProducerKind, ProducerRef,
 };
 
 #[derive(Clone, Copy)]
 enum BackendKind {
     InMemory,
+    File,
 }
 
-fn make_backend(kind: BackendKind) -> Box<dyn AttentionBackend> {
+/// Keeps the file backend's directory alive for the test's duration.
+struct TestBackend {
+    backend: Box<dyn AttentionBackend>,
+    _dir: Option<TempDir>,
+}
+
+fn make_backend(kind: BackendKind) -> TestBackend {
     match kind {
-        BackendKind::InMemory => Box::new(InMemoryAttentionBackend::new()),
+        BackendKind::InMemory => TestBackend {
+            backend: Box::new(InMemoryAttentionBackend::new()),
+            _dir: None,
+        },
+        BackendKind::File => {
+            let dir = TempDir::new().expect("tempdir");
+            TestBackend {
+                backend: Box::new(FileAttentionBackend::new(dir.path())),
+                _dir: Some(dir),
+            }
+        }
     }
 }
 
 /// Run every shared backend test against every implementation.
 ///
-/// There is one today. A coordinator-backed backend adds a module here and
-/// inherits the whole suite unchanged — the discipline exoharness#113 uses to
-/// hold its in-memory and file-backed stores to one set of semantics. These
-/// are written against `&dyn AttentionBackend` for the same reason: nothing in
-/// them may depend on the storage medium.
+/// A coordinator-backed backend adds a module here and inherits the whole
+/// suite unchanged — the discipline exoharness#113 uses to hold its in-memory
+/// and file-backed stores to one set of semantics. These are written against
+/// `&dyn AttentionBackend` for the same reason: nothing in them may depend on
+/// the storage medium.
 macro_rules! attention_backend_suite {
     ($($test:ident),* $(,)?) => {
         mod in_memory {
@@ -30,7 +49,16 @@ macro_rules! attention_backend_suite {
                 #[tokio::test(flavor = "current_thread")]
                 async fn $test() {
                     let backend = super::make_backend(super::BackendKind::InMemory);
-                    super::$test(backend.as_ref()).await;
+                    super::$test(backend.backend.as_ref()).await;
+                }
+            )*
+        }
+        mod file {
+            $(
+                #[tokio::test(flavor = "current_thread")]
+                async fn $test() {
+                    let backend = super::make_backend(super::BackendKind::File);
+                    super::$test(backend.backend.as_ref()).await;
                 }
             )*
         }

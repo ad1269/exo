@@ -33,6 +33,7 @@
 
 mod backend;
 mod dispatcher;
+mod file_backend;
 mod producers;
 mod types;
 
@@ -41,12 +42,15 @@ mod backend_tests;
 #[cfg(test)]
 mod dispatcher_tests;
 #[cfg(test)]
+mod file_backend_tests;
+#[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod producers_tests;
 
 pub use backend::{AttentionBackend, InMemoryAttentionBackend};
 pub use dispatcher::{Action, AttentionState, ConversationState, SandboxState, decide};
+pub use file_backend::FileAttentionBackend;
 pub use producers::{
     AdapterInboundMessage, AdapterNative, SchedulerNative, adapter_dedupe_key, fire_dedupe_key,
     inbox_item_from_adapter_message, inbox_item_from_fire,
