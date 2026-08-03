@@ -65,6 +65,11 @@ export async function deliverParts<T>(
   parts: readonly T[],
   send: (part: T, ref: PartRef) => Promise<void> | void,
 ): Promise<void> {
+  if (parts.length === 0) {
+    // Returning would let sendOnce mark the command sent with zero platform
+    // posts — a phantom delivery. A throw makes it a nack instead.
+    throw new Error(`no parts to deliver for command ${command.id}`);
+  }
   for (const [index, part] of parts.entries()) {
     await send(part, { index, id: partIdentity(command.id, index) });
   }
@@ -120,12 +125,15 @@ export async function runWorker(
       }
     }
   } catch (error) {
-    // A command-stream failure ends the loop, not the process mid-write: the
-    // runtime restarts the worker and requeues whatever was in flight.
+    // Emit, then rethrow so the process exits: a worker with live platform
+    // handles would otherwise idle as a zombie the kernel reads as healthy,
+    // while its claimed commands sit un-acked forever. Exiting engages the
+    // kernel's restart-and-requeue.
     const message = error instanceof Error ? error.message : String(error);
     writeWorkerEvent({
       type: "error",
       message: `worker command stream closed with error: ${message}`,
     });
+    throw error;
   }
 }

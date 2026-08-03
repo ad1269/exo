@@ -141,6 +141,30 @@ describe("runWorker", () => {
     const types = captured.events.map((event) => event.type);
     expect(types).toEqual(["error", "command_ack"]);
   });
+
+  it("a command-stream failure emits an error and rethrows", async () => {
+    // eslint-disable-next-line require-yield
+    async function* brokenStream(): AsyncGenerator<string> {
+      throw new Error("stdin torn");
+    }
+    const captured = captureWorkerEvents();
+    try {
+      await expect(
+        runWorker(
+          { connect: () => {}, deliver: () => {} },
+          { input: brokenStream(), markerDir },
+        ),
+      ).rejects.toThrow("stdin torn");
+    } finally {
+      captured.restore();
+    }
+    expect(captured.events).toEqual([
+      {
+        type: "error",
+        message: "worker command stream closed with error: stdin torn",
+      },
+    ]);
+  });
 });
 
 describe("deliverParts", () => {
@@ -168,6 +192,12 @@ describe("deliverParts", () => {
   it("a retry presents the same identity per part", () => {
     expect(partIdentity("cmd-1", 3)).toBe(partIdentity("cmd-1", 3));
     expect(partIdentity("cmd-1", 3)).not.toBe(partIdentity("cmd-2", 3));
+  });
+
+  it("refuses an empty parts list rather than acking a phantom delivery", async () => {
+    await expect(deliverParts(command, [], () => {})).rejects.toThrow(
+      "no parts to deliver",
+    );
   });
 
   it("stops at the failed part; the walked prefix keeps its identities", async () => {
