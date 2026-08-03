@@ -21,6 +21,7 @@ import {
 import { sendOnce, sentMarkerDir } from "../sent-marker";
 import {
   createResilienceHandlers,
+  discordMessagePayloads,
   inboundAttachments,
   splitDiscordContent,
   startConnectionWatchdog,
@@ -183,11 +184,17 @@ try {
         });
         const files = await discordAttachmentFiles(command.attachments);
         const contentChunks = splitDiscordContent(command.text);
-        for (const [index, content] of contentChunks.entries()) {
-          await sendDiscordMessage(target, {
-            content,
-            files: index === 0 ? files : [],
-          });
+        // Under `enforceNonce` a repeat of a send Discord already accepted
+        // comes back as the existing message, so it lands here as an ordinary
+        // success and is acked like any other send. The nonce closes the
+        // window before the marker is written; the marker closes everything
+        // after.
+        for (const payload of discordMessagePayloads(
+          command.id,
+          contentChunks,
+          files,
+        )) {
+          await sendDiscordMessage(target, payload);
         }
         // If this target has an active voice session, also speak the reply. The
         // text send above doubles as the inspectable transcript of the voice turn.
