@@ -7,6 +7,7 @@ pub(crate) mod worker;
 pub use runtime::{AdapterRunOptions, run_adapters_watch};
 pub use store::AdapterStore;
 pub use types::{
-    AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterEventRecord, AdapterEventType,
-    AdapterRecord, AdapterSource, NewAdapter, WorkerSecretEnvVar,
+    AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatsRecord,
+    AdapterEventRecord, AdapterEventType, AdapterRecord, AdapterSource, NewAdapter,
+    WorkerSecretEnvVar,
 };

@@ -605,6 +605,7 @@ async fn mark_delivered(
     else {
         return Ok(());
     };
+    bump_delivery_stats(store, adapter_id, &delivered_via).await;
     store
         .record_event(
             adapter_id.to_string(),
@@ -622,6 +623,7 @@ async fn record_marker_delivery(
     adapter_id: &str,
     message: &AdapterOutboundMessageRecord,
 ) -> Result<()> {
+    bump_delivery_stats(store, adapter_id, &DeliveredVia::SentMarker).await;
     store
         .record_event(
             adapter_id.to_string(),
@@ -630,6 +632,15 @@ async fn record_marker_delivery(
         )
         .await?;
     Ok(())
+}
+
+/// Counters are observability: a failed bump must not disturb a delivery the
+/// store has already recorded.
+async fn bump_delivery_stats(store: &AdapterStore, adapter_id: &str, delivered_via: &DeliveredVia) {
+    let deduped = matches!(delivered_via, DeliveredVia::SentMarker);
+    if let Err(error) = store.record_delivery_outcome(adapter_id, deduped).await {
+        tracing::warn!(adapter_id, %error, "failed to record delivery stats");
+    }
 }
 
 /// Delivery is recorded first and the audit strictly after. The audit writes to
@@ -1495,6 +1506,32 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let stats = store.delivery_stats("adapter-1").await.unwrap();
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.deduped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_worker_ack_counts_as_delivered_but_not_deduped() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = test_adapter_record();
+        let config = adapter.config.clone();
+        let reported = AtomicBool::new(false);
+        let message = store
+            .enqueue_outbound_message(adapter.id.clone(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+        store.claim_outbound_messages(&adapter.id).await.unwrap();
+        write_sent_marker(&store, &adapter.id, &message.id).await;
+
+        handle_command_ack(&store, &adapter, &config, &reported, &message.id)
+            .await
+            .unwrap();
+
+        let stats = store.delivery_stats(&adapter.id).await.unwrap();
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.deduped, 0);
     }
 
     #[tokio::test]

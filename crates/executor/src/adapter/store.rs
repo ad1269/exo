@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use exoharness::Uuid7;
@@ -7,9 +8,10 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use super::types::{
-    AdapterAttachment, AdapterDeliveryStatus, AdapterEventRecord, AdapterEventType,
-    AdapterInboundMessageRecord, AdapterLifecycleState, AdapterOutboundMessageRecord,
-    AdapterRecord, AdapterTargetConversationRecord, NewAdapter, now_ms,
+    AdapterAttachment, AdapterDeliveryStatsRecord, AdapterDeliveryStatus, AdapterEventRecord,
+    AdapterEventType, AdapterInboundMessageRecord, AdapterLifecycleState,
+    AdapterOutboundMessageRecord, AdapterRecord, AdapterTargetConversationRecord, NewAdapter,
+    now_ms,
 };
 
 const MAX_QUEUED_MESSAGES_PER_ADAPTER: usize = 1_000;
@@ -19,11 +21,20 @@ pub(crate) const MAX_DELIVERY_ATTEMPTS: u32 = 3;
 #[derive(Debug, Clone)]
 pub struct AdapterStore {
     root: PathBuf,
+    /// One adapter runtime hosts two tasks that record deliveries — command
+    /// dispatch (marker dedupe) and event handling (acks, nacks at the cap) —
+    /// so the stats read-increment-write needs a lock to not lose bumps.
+    /// Cross-process writers do not exist: the runner lock admits one adapter
+    /// runtime and the CLI only reads.
+    stats_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AdapterStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            stats_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -144,6 +155,7 @@ impl AdapterStore {
         remove_dir_if_exists(self.inbound_seen_dir(adapter_id)).await?;
         remove_dir_if_exists(self.outbound_sent_dir(adapter_id)).await?;
         remove_dir_if_exists(self.target_conversations_dir(adapter_id)).await?;
+        remove_file_if_exists(self.delivery_stats_path(adapter_id)).await?;
         Ok(Some(adapter))
     }
 
@@ -569,6 +581,52 @@ impl AdapterStore {
     fn outbound_sent_path(&self, adapter_id: &str, message_id: &str) -> PathBuf {
         self.outbound_sent_dir(adapter_id)
             .join(format!("{message_id}.json"))
+    }
+
+    pub async fn delivery_stats(&self, adapter_id: &str) -> Result<AdapterDeliveryStatsRecord> {
+        let path = self.delivery_stats_path(adapter_id);
+        match fs::read(&path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse delivery stats {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(AdapterDeliveryStatsRecord::default())
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to read delivery stats {}", path.display())),
+        }
+    }
+
+    pub async fn record_delivery_outcome(
+        &self,
+        adapter_id: &str,
+        deduped: bool,
+    ) -> Result<AdapterDeliveryStatsRecord> {
+        let _guard = self.stats_lock.lock().await;
+        // A stats file that stopped parsing would otherwise wedge the counter
+        // for good; restarting the count costs history, not correctness, and
+        // matches how an unreadable sent marker reads as absent.
+        let mut stats = match self.delivery_stats(adapter_id).await {
+            Ok(stats) => stats,
+            Err(error) => {
+                tracing::warn!(adapter_id, %error, "resetting unreadable delivery stats");
+                AdapterDeliveryStatsRecord::default()
+            }
+        };
+        stats.delivered += 1;
+        if deduped {
+            stats.deduped += 1;
+        }
+        fs::create_dir_all(self.delivery_stats_dir()).await?;
+        write_json_file(&self.delivery_stats_path(adapter_id), &stats).await?;
+        Ok(stats)
+    }
+
+    fn delivery_stats_dir(&self) -> PathBuf {
+        self.root.join("delivery-stats")
+    }
+
+    fn delivery_stats_path(&self, adapter_id: &str) -> PathBuf {
+        self.delivery_stats_dir().join(format!("{adapter_id}.json"))
     }
 
     fn adapters_dir(&self) -> PathBuf {
@@ -1229,6 +1287,98 @@ mod tests {
                 .unwrap()
         );
         assert!(!store.outbound_sent_dir(&adapter.id).exists());
+    }
+
+    #[tokio::test]
+    async fn delivery_stats_accumulate_and_are_removed_with_the_adapter() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let adapter = store
+            .create_adapter(NewAdapter {
+                agent_id: "agent".to_string(),
+                conversation_id: "conversation".to_string(),
+                name: "irc".to_string(),
+                source: AdapterSource::Library,
+                config: AdapterConfig {
+                    adapter_type: "irc".to_string(),
+                    worker_command: vec!["node".to_string(), "irc.js".to_string()],
+                    initialization: serde_json::json!({}),
+                    state_dir: None,
+                    secret_env: Vec::new(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.delivery_stats(&adapter.id).await.unwrap(),
+            AdapterDeliveryStatsRecord::default()
+        );
+
+        store
+            .record_delivery_outcome(&adapter.id, false)
+            .await
+            .unwrap();
+        let stats = store
+            .record_delivery_outcome(&adapter.id, true)
+            .await
+            .unwrap();
+        assert_eq!(stats.delivered, 2);
+        assert_eq!(stats.deduped, 1);
+        assert_eq!(store.delivery_stats(&adapter.id).await.unwrap(), stats);
+
+        store.delete_adapter(&adapter.id).await.unwrap();
+        assert_eq!(
+            store.delivery_stats(&adapter.id).await.unwrap(),
+            AdapterDeliveryStatsRecord::default()
+        );
+    }
+
+    // The runtime's command task and event task both record deliveries, so
+    // concurrent bumps must all land.
+    #[tokio::test]
+    async fn concurrent_delivery_outcomes_all_land() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+
+        let bumps = (0..20).map(|index| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .record_delivery_outcome("adapter", index % 2 == 0)
+                    .await
+            })
+        });
+        for bump in bumps.collect::<Vec<_>>() {
+            bump.await.unwrap().unwrap();
+        }
+
+        let stats = store.delivery_stats("adapter").await.unwrap();
+        assert_eq!(stats.delivered, 20);
+        assert_eq!(stats.deduped, 10);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_stats_file_resets_instead_of_wedging_the_counter() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        store
+            .record_delivery_outcome("adapter", false)
+            .await
+            .unwrap();
+        fs::write(
+            tempdir.path().join("delivery-stats").join("adapter.json"),
+            "not json",
+        )
+        .await
+        .unwrap();
+
+        assert!(store.delivery_stats("adapter").await.is_err());
+        let stats = store
+            .record_delivery_outcome("adapter", true)
+            .await
+            .unwrap();
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.deduped, 1);
     }
 
     // Markers are written by the worker, never by the kernel.

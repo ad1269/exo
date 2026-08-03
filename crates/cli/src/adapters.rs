@@ -31,6 +31,7 @@ pub enum AdapterCommands {
     Delete {
         adapter_id: String,
     },
+    Stats,
 }
 
 pub async fn handle_adapter_command(
@@ -90,6 +91,35 @@ pub async fn handle_adapter_command(
             } else {
                 bail!("adapter not found: {adapter_id}");
             }
+        }
+        AdapterCommands::Stats => {
+            let mut writer = TabWriter::new(std::io::stdout());
+            writeln!(writer, "ADAPTER\tDELIVERED\tDEDUPED\tDEDUPE%")?;
+            for adapter in store.list_adapters().await? {
+                // One unreadable stats file must not take down the table for
+                // every other adapter.
+                match store.delivery_stats(&adapter.id).await {
+                    Ok(stats) => {
+                        let rate = if stats.delivered == 0 {
+                            "-".to_string()
+                        } else {
+                            format!(
+                                "{:.1}",
+                                100.0 * stats.deduped as f64 / stats.delivered as f64
+                            )
+                        };
+                        writeln!(
+                            writer,
+                            "{}\t{}\t{}\t{}",
+                            adapter.id, stats.delivered, stats.deduped, rate
+                        )?;
+                    }
+                    Err(error) => {
+                        writeln!(writer, "{}\t?\t?\t? ({error:#})", adapter.id)?;
+                    }
+                }
+            }
+            writer.flush()?;
         }
     }
     Ok(())

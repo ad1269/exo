@@ -106,6 +106,17 @@ pub struct AdapterEventRecord {
     pub summary: String,
 }
 
+/// Running totals per adapter: every message that reached delivered, and the
+/// subset delivered by the sent-marker check instead of a worker ack.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterDeliveryStatsRecord {
+    #[serde(default)]
+    pub delivered: u64,
+    #[serde(default)]
+    pub deduped: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdapterOutboundMessageRecord {
     pub id: String,
