@@ -1,15 +1,19 @@
 use serde_json::Value;
 
 use super::{
-    Action, AdapterInboundMessage, Attention, AttentionBackend, ConversationState, DispatchLease,
-    InMemoryAttentionBackend, InboxItem, decide, inbox_item_from_adapter_message,
-    inbox_item_from_fire,
+    Action, AdapterInboundMessage, Attention, AttentionBackend, AttentionState, ConversationState,
+    DispatchLease, InMemoryAttentionBackend, InboxItem, SandboxState, decide,
+    inbox_item_from_adapter_message, inbox_item_from_fire,
 };
 use crate::{AdapterConfig, AdapterRecord, AdapterSource, NewAdapter, ScheduledFireRecord};
 
 const CONVERSATION: &str = "conversation-1";
 const T0: u64 = 1_700_000_000_000;
 const BATCH_MAX_WAIT_MS: u64 = 60_000;
+const QUIESCENT_IDLE: ConversationState = ConversationState {
+    attention: AttentionState::Quiescent,
+    sandbox: SandboxState::Idle,
+};
 
 /// The entire runtime half of the loop: renew the lease, read what is
 /// pending, ask the pure core what to do, and do it. Everything that
@@ -181,14 +185,7 @@ async fn the_dispatcher_coalesces_two_producers_holds_a_batch_item_and_flushes_i
     };
 
     // One turn, both items, oldest first: coalescing is draining.
-    let opened = dispatch_once(
-        &backend,
-        &lease,
-        ConversationState::Quiescent,
-        T0 + 10,
-        &mut open_turn,
-    )
-    .await;
+    let opened = dispatch_once(&backend, &lease, QUIESCENT_IDLE, T0 + 10, &mut open_turn).await;
     assert_eq!(
         opened,
         Action::OpenTurn {
@@ -238,14 +235,7 @@ async fn the_dispatcher_coalesces_two_producers_holds_a_batch_item_and_flushes_i
         .await
         .expect("append scrape");
 
-    let held = dispatch_once(
-        &backend,
-        &lease,
-        ConversationState::Quiescent,
-        T0 + 40,
-        &mut open_turn,
-    )
-    .await;
+    let held = dispatch_once(&backend, &lease, QUIESCENT_IDLE, T0 + 40, &mut open_turn).await;
     assert_eq!(
         held,
         Action::Wait {
@@ -266,7 +256,7 @@ async fn the_dispatcher_coalesces_two_producers_holds_a_batch_item_and_flushes_i
     let flushed = dispatch_once(
         &backend,
         &lease,
-        ConversationState::Quiescent,
+        QUIESCENT_IDLE,
         T0 + 30 + BATCH_MAX_WAIT_MS,
         &mut open_turn,
     )
@@ -281,7 +271,7 @@ async fn the_dispatcher_coalesces_two_producers_holds_a_batch_item_and_flushes_i
     let idle = dispatch_once(
         &backend,
         &lease,
-        ConversationState::Quiescent,
+        QUIESCENT_IDLE,
         T0 + 200_000,
         &mut open_turn,
     )

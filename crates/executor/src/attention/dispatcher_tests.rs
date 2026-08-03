@@ -2,8 +2,16 @@ use exoharness::Uuid7;
 use serde_json::Value;
 
 use super::{
-    Action, Attention, ConversationState, InboxItem, ItemId, ProducerKind, ProducerRef, decide,
+    Action, Attention, AttentionState, ConversationState, InboxItem, ItemId, ProducerKind,
+    ProducerRef, SandboxState, decide,
 };
+
+fn over_idle_sandbox(attention: AttentionState) -> ConversationState {
+    ConversationState {
+        attention,
+        sandbox: SandboxState::Idle,
+    }
+}
 
 fn item(dedupe_key: &str, attention: Attention, appended_at_ms: u64) -> InboxItem {
     InboxItem {
@@ -28,12 +36,15 @@ fn ids(items: &[InboxItem]) -> Vec<ItemId> {
 
 #[test]
 fn an_empty_inbox_asks_for_nothing_in_every_state() {
-    for state in [
-        ConversationState::TurnRunning,
-        ConversationState::AtRoundBoundary,
-        ConversationState::Quiescent,
+    for attention in [
+        AttentionState::TurnRunning,
+        AttentionState::AtRoundBoundary,
+        AttentionState::Quiescent,
     ] {
-        assert_eq!(decide(state, &[], 1_000), Action::Nothing);
+        for sandbox in [SandboxState::Idle, SandboxState::CommandRunning] {
+            let state = ConversationState { attention, sandbox };
+            assert_eq!(decide(state, &[], 1_000), Action::Nothing);
+        }
     }
 }
 
@@ -45,7 +56,11 @@ fn a_running_turn_mid_round_admits_nothing() {
         item("overdue-batch", Attention::Batch { max_wait_ms: 5 }, 30),
     ];
     assert_eq!(
-        decide(ConversationState::TurnRunning, &pending, 10_000),
+        decide(
+            over_idle_sandbox(AttentionState::TurnRunning),
+            &pending,
+            10_000
+        ),
         Action::Nothing
     );
 }
@@ -60,7 +75,11 @@ fn a_round_boundary_offers_interrupts_and_only_interrupts() {
     ];
     let expected = vec![pending[3].item_id, pending[1].item_id];
     assert_eq!(
-        decide(ConversationState::AtRoundBoundary, &pending, 10_000),
+        decide(
+            over_idle_sandbox(AttentionState::AtRoundBoundary),
+            &pending,
+            10_000
+        ),
         Action::OfferInterrupt { items: expected }
     );
 }
@@ -74,7 +93,11 @@ fn a_round_boundary_with_no_interrupt_waits_for_the_turn_to_end() {
         item("batch", Attention::Batch { max_wait_ms: 5 }, 20),
     ];
     assert_eq!(
-        decide(ConversationState::AtRoundBoundary, &pending, 10_000),
+        decide(
+            over_idle_sandbox(AttentionState::AtRoundBoundary),
+            &pending,
+            10_000
+        ),
         Action::Nothing
     );
 }
@@ -83,7 +106,11 @@ fn a_round_boundary_with_no_interrupt_waits_for_the_turn_to_end() {
 fn quiescent_with_a_wake_opens_a_turn() {
     let pending = vec![item("wake", Attention::Wake, 10)];
     assert_eq!(
-        decide(ConversationState::Quiescent, &pending, 1_000),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            1_000
+        ),
         Action::OpenTurn {
             drain: ids(&pending)
         }
@@ -94,7 +121,11 @@ fn quiescent_with_a_wake_opens_a_turn() {
 fn quiescent_with_an_interrupt_opens_a_turn_rather_than_waiting_for_a_boundary() {
     let pending = vec![item("interrupt", Attention::Interrupt, 10)];
     assert_eq!(
-        decide(ConversationState::Quiescent, &pending, 1_000),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            1_000
+        ),
         Action::OpenTurn {
             drain: ids(&pending)
         }
@@ -130,7 +161,11 @@ fn one_wake_drains_every_pending_item_into_one_turn() {
             50,
         ),
     ];
-    let action = decide(ConversationState::Quiescent, &pending, 1_000);
+    let action = decide(
+        over_idle_sandbox(AttentionState::Quiescent),
+        &pending,
+        1_000,
+    );
     assert_eq!(
         action,
         Action::OpenTurn {
@@ -146,7 +181,11 @@ fn drain_order_is_append_order_whatever_order_the_backend_hands_over() {
     let third = item("third", Attention::Wake, 30);
     let shuffled = vec![third.clone(), first.clone(), second.clone()];
     assert_eq!(
-        decide(ConversationState::Quiescent, &shuffled, 1_000),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &shuffled,
+            1_000
+        ),
         Action::OpenTurn {
             drain: vec![first.item_id, second.item_id, third.item_id]
         }
@@ -160,7 +199,11 @@ fn held_batch_items_wait_until_the_earliest_bound_expires() {
         item("near", Attention::Batch { max_wait_ms: 500 }, 1_000),
     ];
     assert_eq!(
-        decide(ConversationState::Quiescent, &pending, 1_200),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            1_200
+        ),
         Action::Wait { until_ms: 1_500 }
     );
 }
@@ -169,11 +212,19 @@ fn held_batch_items_wait_until_the_earliest_bound_expires() {
 fn a_batch_bound_flushes_on_the_millisecond_it_expires() {
     let pending = vec![item("batch", Attention::Batch { max_wait_ms: 500 }, 1_000)];
     assert_eq!(
-        decide(ConversationState::Quiescent, &pending, 1_499),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            1_499
+        ),
         Action::Wait { until_ms: 1_500 }
     );
     assert_eq!(
-        decide(ConversationState::Quiescent, &pending, 1_500),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            1_500
+        ),
         Action::FlushBatch {
             drain: ids(&pending)
         }
@@ -193,7 +244,44 @@ fn an_expired_bound_flushes_every_held_item_not_just_the_expired_one() {
         ),
     ];
     assert_eq!(
-        decide(ConversationState::Quiescent, &pending, 2_000),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            2_000
+        ),
+        Action::FlushBatch {
+            drain: ids(&pending)
+        }
+    );
+}
+
+#[test]
+fn a_busy_sandbox_blocks_a_wake_from_opening_a_turn() {
+    // No turn is running, but a dispatcher-run command holds the sandbox: the
+    // wake must wait for the command to complete, exactly as it would wait for
+    // a running turn to end.
+    let pending = vec![item("wake", Attention::Wake, 10)];
+    let state = ConversationState {
+        attention: AttentionState::Quiescent,
+        sandbox: SandboxState::CommandRunning,
+    };
+    assert_eq!(decide(state, &pending, 1_000), Action::Nothing);
+}
+
+#[test]
+fn a_batch_bound_that_expires_under_a_busy_sandbox_flushes_once_it_goes_idle() {
+    let pending = vec![item("batch", Attention::Batch { max_wait_ms: 500 }, 1_000)];
+    let busy = ConversationState {
+        attention: AttentionState::Quiescent,
+        sandbox: SandboxState::CommandRunning,
+    };
+    assert_eq!(decide(busy, &pending, 2_000), Action::Nothing);
+    assert_eq!(
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            2_000
+        ),
         Action::FlushBatch {
             drain: ids(&pending)
         }
@@ -210,7 +298,11 @@ fn a_bound_too_large_to_represent_reads_as_never_rather_than_as_overdue() {
         10,
     )];
     assert_eq!(
-        decide(ConversationState::Quiescent, &pending, 1_000),
+        decide(
+            over_idle_sandbox(AttentionState::Quiescent),
+            &pending,
+            1_000
+        ),
         Action::Wait { until_ms: u64::MAX }
     );
 }

@@ -2,11 +2,20 @@ use super::types::{Attention, InboxItem, ItemId};
 
 /// Where the conversation is, from the dispatcher's point of view.
 ///
-/// A conversation has two serial resources — the agent's attention and the
-/// sandbox's world state — and one dispatcher owns both, so this is the whole
-/// state space it needs.
+/// A conversation has two serial resources — the agent's attention (turns)
+/// and the sandbox's world state (commands) — and one dispatcher owns both,
+/// so its state is the product of the two. A single enum could not say "no
+/// turn, but a dispatcher-run command is in the sandbox", and that is a state
+/// the dispatcher must refuse to open a turn in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConversationState {
+pub struct ConversationState {
+    pub attention: AttentionState,
+    pub sandbox: SandboxState,
+}
+
+/// Where the agent's attention is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionState {
     /// A turn is executing and is mid-round. Nothing can enter it, and no new
     /// turn may open.
     TurnRunning,
@@ -17,6 +26,14 @@ pub enum ConversationState {
     AtRoundBoundary,
     /// No turn is running.
     Quiescent,
+}
+
+/// Where the sandbox's world state is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxState {
+    Idle,
+    /// A dispatcher-run scheduled command is executing in the sandbox.
+    CommandRunning,
 }
 
 /// What the dispatcher should do next.
@@ -41,9 +58,10 @@ pub enum Action {
     /// Nothing to do until this wall-clock instant, when a batch bound
     /// expires. The dispatcher may also be woken earlier by an append.
     Wait { until_ms: u64 },
-    /// Nothing to do, and no clock will change that — either the inbox is
-    /// empty, or a turn is running and the pending items cannot enter it. The
-    /// next decision point is the turn ending or an item arriving.
+    /// Nothing to do, and no clock will change that — the inbox is empty, a
+    /// turn is running and the pending items cannot enter it, or a
+    /// dispatcher-run command holds the sandbox. The next decision point is
+    /// the turn or command ending, or an item arriving.
     Nothing,
 }
 
@@ -56,12 +74,19 @@ pub enum Action {
 /// The contract it encodes:
 ///
 /// - a running turn admits [`Attention::Interrupt`] items, and only at a
-///   round boundary;
-/// - quiescent, with any `Wake` or `Interrupt` pending, drains *everything*
-///   pending into one turn — held `Batch` items ride along, which is what
-///   "flushed with the next turn" means;
-/// - quiescent, with only `Batch` items pending, waits until the earliest
-///   `appended_at_ms + max_wait_ms` and then flushes;
+///   round boundary — sandbox state notwithstanding, because interrupt items
+///   join an existing turn's prompt and open no new work in the sandbox;
+/// - quiescent with the sandbox held by a dispatcher-run command, nothing may
+///   open a turn, whatever is pending: a turn's agent commands must not
+///   interleave with a scheduled command in the same sandbox. The next
+///   decision point is the command completing, exactly as `TurnRunning`'s is
+///   the turn ending. A batch bound that passes while the sandbox is busy
+///   flushes on the first decide after it goes idle;
+/// - quiescent over an idle sandbox, with any `Wake` or `Interrupt` pending,
+///   drains *everything* pending into one turn — held `Batch` items ride
+///   along, which is what "flushed with the next turn" means;
+/// - quiescent over an idle sandbox, with only `Batch` items pending, waits
+///   until the earliest `appended_at_ms + max_wait_ms` and then flushes;
 /// - liveness: every pending item is drained by some turn. A `Wake` or
 ///   `Interrupt` is drained by the next quiescent decision; a `Batch` item is
 ///   drained no later than its own bound, because that bound is what the
@@ -70,9 +95,9 @@ pub fn decide(state: ConversationState, pending: &[InboxItem], now_ms: u64) -> A
     if pending.is_empty() {
         return Action::Nothing;
     }
-    match state {
-        ConversationState::TurnRunning => Action::Nothing,
-        ConversationState::AtRoundBoundary => {
+    match state.attention {
+        AttentionState::TurnRunning => Action::Nothing,
+        AttentionState::AtRoundBoundary => {
             let items: Vec<ItemId> = fifo(pending)
                 .into_iter()
                 .filter(|item| item.attention == Attention::Interrupt)
@@ -84,7 +109,10 @@ pub fn decide(state: ConversationState, pending: &[InboxItem], now_ms: u64) -> A
                 Action::OfferInterrupt { items }
             }
         }
-        ConversationState::Quiescent => {
+        AttentionState::Quiescent => {
+            if state.sandbox == SandboxState::CommandRunning {
+                return Action::Nothing;
+            }
             let ordered = fifo(pending);
             let drain: Vec<ItemId> = ordered.iter().map(|item| item.item_id).collect();
             if ordered
