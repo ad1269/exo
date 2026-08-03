@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import readline from "node:readline/promises";
 import process from "node:process";
 
@@ -35,6 +36,39 @@ export type RunWorkerHooks = {
     ctx: WorkerContext,
   ) => Promise<void> | void;
 };
+
+// One part of a multi-part send: its position and its stable identity.
+export type PartRef = {
+  index: number;
+  id: string;
+};
+
+// Deterministic identity for one part of a command, so a retried command
+// presents the same key per part and a platform with an idempotency key
+// re-posts only the parts it has not seen. Full hex; platforms truncate to
+// their own limit — Discord's 25-char enforced nonce is a prefix of this.
+export function partIdentity(commandId: string, index: number): string {
+  return createHash("sha256")
+    .update(commandId)
+    .update("\0")
+    .update(String(index))
+    .digest("hex");
+}
+
+// Deliver a command as ordered parts, each with its identity. Sequential on
+// purpose: parts are chunks of one message, and posting them out of order
+// scrambles the reply. A throw stops at the failed part; the retry re-walks
+// every part, and per-part identity is what keeps the walked-again prefix
+// from double-posting where the platform can check it.
+export async function deliverParts<T>(
+  command: WorkerOutboundCommand,
+  parts: readonly T[],
+  send: (part: T, ref: PartRef) => Promise<void> | void,
+): Promise<void> {
+  for (const [index, part] of parts.entries()) {
+    await send(part, { index, id: partIdentity(command.id, index) });
+  }
+}
 
 export type RunWorkerOptions = {
   // Test seams; production workers take the defaults.

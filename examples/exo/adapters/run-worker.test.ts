@@ -5,7 +5,7 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { runWorker } from "./run-worker";
+import { deliverParts, partIdentity, runWorker } from "./run-worker";
 import type { WorkerOutboundCommand } from "./protocol";
 
 let tempdir: string;
@@ -140,5 +140,46 @@ describe("runWorker", () => {
 
     const types = captured.events.map((event) => event.type);
     expect(types).toEqual(["error", "command_ack"]);
+  });
+});
+
+describe("deliverParts", () => {
+  const command: WorkerOutboundCommand = {
+    type: "send_message",
+    id: "cmd-1",
+    target: "#room",
+    text: "one two",
+    attachments: [],
+  };
+
+  it("sends parts in order, each with a stable identity", async () => {
+    const seen: { part: string; index: number; id: string }[] = [];
+    await deliverParts(command, ["one", "two"], (part, ref) => {
+      seen.push({ part, index: ref.index, id: ref.id });
+    });
+
+    expect(seen.map((entry) => entry.part)).toEqual(["one", "two"]);
+    expect(seen.map((entry) => entry.index)).toEqual([0, 1]);
+    expect(seen[0].id).toBe(partIdentity("cmd-1", 0));
+    expect(seen[1].id).toBe(partIdentity("cmd-1", 1));
+    expect(seen[0].id).not.toBe(seen[1].id);
+  });
+
+  it("a retry presents the same identity per part", () => {
+    expect(partIdentity("cmd-1", 3)).toBe(partIdentity("cmd-1", 3));
+    expect(partIdentity("cmd-1", 3)).not.toBe(partIdentity("cmd-2", 3));
+  });
+
+  it("stops at the failed part; the walked prefix keeps its identities", async () => {
+    const sent: string[] = [];
+    await expect(
+      deliverParts(command, ["one", "two", "three"], (part) => {
+        if (part === "two") {
+          throw new Error("send failed");
+        }
+        sent.push(part);
+      }),
+    ).rejects.toThrow("send failed");
+    expect(sent).toEqual(["one"]);
   });
 });
