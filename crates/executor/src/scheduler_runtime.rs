@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -6,6 +7,8 @@ use futures::io::{AsyncRead, AsyncReadExt};
 use serde::Serialize;
 
 use crate::agent_sandbox::ensure_agent_sandbox;
+use crate::attention::{Attention, inbox_item_from_fire};
+use crate::attention_dispatch::{attention_dir_from_env, deliver_via_inbox};
 use crate::conversation_sandbox::{create_conversation_sandbox, ensure_conversation_sandbox};
 use crate::conversation_wakeup::send_conversation_wakeup;
 use crate::scheduler_store::SchedulerStore;
@@ -13,7 +16,7 @@ use crate::scheduler_types::{
     DEFAULT_COMMAND_TIMEOUT_MS, DEFAULT_TASK_LEASE_MS, ScheduledFireRecord, ScheduledTaskRecord,
     ScheduledTaskRunRecord, ScheduledTaskSandboxMode, now_ms,
 };
-use crate::{Harness, Uuid7};
+use crate::{Harness, HarnessConversation, Uuid7};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerRunOptions {
@@ -72,6 +75,7 @@ pub async fn redeliver_pending_wakes(
     harness: Arc<dyn Harness>,
     store: &SchedulerStore,
 ) -> Result<usize> {
+    let attention_dir = attention_dir_from_env();
     let mut delivered = 0;
     for fire in store.pending_fires().await? {
         let Some(agent) = harness.get_agent(&fire.agent_id).await? else {
@@ -88,13 +92,35 @@ pub async fn redeliver_pending_wakes(
                 .await?;
             continue;
         };
-        send_conversation_wakeup(conversation.as_ref(), fire.prompt.clone()).await?;
+        deliver_fire_wakeup(attention_dir.as_deref(), conversation.as_ref(), &fire).await?;
         store
             .mark_fire_delivered(&fire.task_id, fire.slot_ms)
             .await?;
         delivered += 1;
     }
     Ok(delivered)
+}
+
+/// One fire wakeup, on whichever path the flag selects: an inbox item when an
+/// attention dir is set, the legacy wakeup funnel otherwise.
+///
+/// All fires map to [`Attention::Wake`] for now — the task record has no
+/// attention field yet, so per-task mapping is future work.
+async fn deliver_fire_wakeup(
+    attention_dir: Option<&Path>,
+    conversation: &dyn HarnessConversation,
+    fire: &ScheduledFireRecord,
+) -> Result<()> {
+    match attention_dir {
+        Some(dir) => {
+            let item = inbox_item_from_fire(fire, Attention::Wake, now_ms())?;
+            deliver_via_inbox(dir, conversation, item).await
+        }
+        None => {
+            send_conversation_wakeup(conversation, fire.prompt.clone()).await?;
+            Ok(())
+        }
+    }
 }
 
 /// Runs whatever the task's missed-fire policy says it owes at this moment,
@@ -106,10 +132,20 @@ pub async fn run_task(
     store: &SchedulerStore,
     mut task: ScheduledTaskRecord,
 ) -> Result<Vec<ScheduledTaskRunRecord>> {
+    let attention_dir = attention_dir_from_env();
     let plan = task.plan_missed_fires(now_ms())?;
     let mut runs = Vec::with_capacity(plan.fire_slots.len());
     for slot_ms in &plan.fire_slots {
-        runs.push(fire_once(Arc::clone(&harness), store, &mut task, *slot_ms).await?);
+        runs.push(
+            fire_once(
+                Arc::clone(&harness),
+                store,
+                &mut task,
+                *slot_ms,
+                attention_dir.as_deref(),
+            )
+            .await?,
+        );
         if !task.enabled {
             // The agent or conversation is gone; the rest of the backlog would
             // fail identically.
@@ -126,10 +162,19 @@ async fn fire_once(
     store: &SchedulerStore,
     task: &mut ScheduledTaskRecord,
     slot_ms: u64,
+    attention_dir: Option<&Path>,
 ) -> Result<ScheduledTaskRunRecord> {
     let started_at_ms = now_ms();
     let run_id = Uuid7::now().to_string();
-    let run_result = run_task_inner(Arc::clone(&harness), store, task, &run_id, slot_ms).await;
+    let run_result = run_task_inner(
+        Arc::clone(&harness),
+        store,
+        task,
+        &run_id,
+        slot_ms,
+        attention_dir,
+    )
+    .await;
     let finished_at_ms = now_ms();
 
     let (mut run, result_artifact_id) = match run_result {
@@ -204,6 +249,7 @@ async fn run_task_inner(
     task: &mut ScheduledTaskRecord,
     run_id: &str,
     slot_ms: u64,
+    attention_dir: Option<&Path>,
 ) -> Result<TaskOutput> {
     let agent = harness
         .get_agent(&task.agent_id)
@@ -350,7 +396,7 @@ async fn run_task_inner(
         fired_at_ms: now_ms(),
     };
     store.put_pending_fire(&fire).await?;
-    send_conversation_wakeup(conversation.as_ref(), fire.prompt.clone()).await?;
+    deliver_fire_wakeup(attention_dir, conversation.as_ref(), &fire).await?;
     store
         .mark_fire_delivered(&fire.task_id, fire.slot_ms)
         .await?;

@@ -51,6 +51,7 @@ mod producers_tests;
 pub use backend::{AttentionBackend, InMemoryAttentionBackend};
 pub use dispatcher::{Action, AttentionState, ConversationState, SandboxState, decide};
 pub use file_backend::FileAttentionBackend;
+pub(crate) use file_backend::LEASE_TTL_MS;
 pub use producers::{
     AdapterInboundMessage, AdapterNative, SchedulerNative, adapter_dedupe_key, fire_dedupe_key,
     inbox_item_from_adapter_message, inbox_item_from_fire,

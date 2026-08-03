@@ -14,7 +14,7 @@ use crate::now_ms;
 /// How long a dispatch lease lives without renewal. A holder that dies takes
 /// its renewal task with it, so this is the takeover latency for a
 /// conversation orphaned by a crash.
-const LEASE_TTL_MS: u64 = 60_000;
+pub(crate) const LEASE_TTL_MS: u64 = 60_000;
 
 /// File-backed [`AttentionBackend`]: cross-process on one box, one directory
 /// per conversation.

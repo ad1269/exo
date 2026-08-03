@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use executor::attention::{Attention, InboxItem, ProducerKind, ProducerRef};
+use executor::attention_dispatch::{attention_dir_from_env, deliver_via_inbox};
 use executor::{
     AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, BasicHarness,
     BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
@@ -37,8 +39,8 @@ use executor::{
     SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
     TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
     default_daytona_image, default_docker_image, default_e2b_template, default_vercel_image,
-    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, now_ms,
+    record_host_event, send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -1978,7 +1980,20 @@ async fn main() -> Result<()> {
                 let conversation =
                     must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
                 let previous_messages = conversation.messages().await?;
-                send_conversation_wakeup(conversation.as_ref(), prompt).await?;
+                match attention_dir_from_env() {
+                    Some(dir) => {
+                        let item =
+                            cli_send_inbox_item(conversation.record().id.to_string(), prompt);
+                        // When another process holds the dispatch lease the
+                        // item is appended and drained there, so the tail
+                        // below may print nothing — the funnel working, not
+                        // a bug.
+                        deliver_via_inbox(&dir, conversation.as_ref(), item).await?;
+                    }
+                    None => {
+                        send_conversation_wakeup(conversation.as_ref(), prompt).await?;
+                    }
+                }
                 let messages = conversation.messages().await?;
                 for message in &messages[previous_messages.len()..] {
                     print_message(message, Verbosity::Full);
@@ -3000,6 +3015,26 @@ fn is_env_var_name(env: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+/// A human arrives via an adapter, and the CLI is one, so the producer is
+/// `adapter/cli`. A CLI send has no platform message id — each send is its
+/// own occurrence — so the dedupe key is a freshly minted UUIDv7.
+fn cli_send_inbox_item(conversation_id: String, prompt: String) -> InboxItem {
+    InboxItem {
+        item_id: Uuid7::now(),
+        conversation_id,
+        producer: ProducerRef {
+            kind: ProducerKind::Adapter,
+            id: "cli".to_string(),
+        },
+        dedupe_key: Uuid7::now().to_string(),
+        attention: Attention::Wake,
+        native: serde_json::Value::Null,
+        prompt,
+        artifacts: Vec::new(),
+        appended_at_ms: now_ms(),
+    }
+}
+
 const SLUG_WORDS_A: &[&str] = &[
     "amber", "aster", "basil", "cedar", "cinder", "cobalt", "ember", "fable", "glacier", "harbor",
     "ivy", "juniper", "lilac", "marble", "north", "onyx", "pony", "quartz", "river", "solstice",
@@ -3027,6 +3062,23 @@ pub(crate) fn generate_fun_slug_from_uuid(uuid: Uuid7) -> String {
 #[cfg(test)]
 mod create_tests {
     use super::repl_command;
+
+    #[test]
+    fn cli_send_items_are_each_their_own_occurrence() {
+        let first = super::cli_send_inbox_item("conversation-1".to_string(), "hello".to_string());
+        let second = super::cli_send_inbox_item("conversation-1".to_string(), "hello".to_string());
+
+        // Identical prompts, distinct occurrences: resending on purpose must
+        // wake the conversation twice.
+        assert_ne!(first.dedupe_key, second.dedupe_key);
+        assert_eq!(
+            first.producer.kind,
+            executor::attention::ProducerKind::Adapter
+        );
+        assert_eq!(first.producer.id, "cli");
+        assert_eq!(first.attention, executor::attention::Attention::Wake);
+        assert_eq!(first.prompt, "hello");
+    }
 
     #[test]
     fn repl_command_uses_agent_and_conversation_slugs() {

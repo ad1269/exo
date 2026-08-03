@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use exoharness::{AgentHandle, ConversationHandle, Secret, SecretId};
+use exoharness::{AgentHandle, ConversationHandle, Secret, SecretId, Uuid7};
 use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -20,6 +20,11 @@ use super::types::{
     AdapterEventType, AdapterRecord, AdapterTargetConversationRecord, now_ms,
 };
 use super::worker::{WorkerCommand, WorkerEvent, run_worker_loop};
+use crate::attention::{
+    AdapterInboundMessage, Attention, InboxItem, ProducerKind, ProducerRef,
+    inbox_item_from_adapter_message,
+};
+use crate::attention_dispatch::{attention_dir_from_env, deliver_via_inbox};
 use crate::conversation_events::{
     HOST_EVENT_ADAPTER_RUNNER_DRAINING, HOST_EVENT_ADAPTER_RUNNER_STARTED, HOST_EVENT_REBOOT,
     record_host_event,
@@ -74,6 +79,7 @@ pub async fn run_adapters_watch(
     store: AdapterStore,
     options: AdapterRunOptions,
 ) -> Result<()> {
+    let attention_dir = attention_dir_from_env();
     let running = Arc::new(Mutex::new(HashSet::<String>::new()));
     let drain = Arc::new(AtomicBool::new(false));
     let mut supervisors = JoinSet::new();
@@ -84,8 +90,9 @@ pub async fn run_adapters_watch(
         // the relevant worker is connected.
         let harness = Arc::clone(&harness);
         let store = store.clone();
+        let attention_dir = attention_dir.clone();
         tokio::spawn(async move {
-            if let Err(error) = announce_reboot(harness, store, notice).await {
+            if let Err(error) = announce_reboot(harness, store, notice, attention_dir).await {
                 tracing::error!(%error, "failed to announce adapter runner reboot");
             }
         });
@@ -132,9 +139,10 @@ pub async fn run_adapters_watch(
             let store = store.clone();
             let running = Arc::clone(&running);
             let drain = Arc::clone(&drain);
+            let attention_dir = attention_dir.clone();
             supervisors.spawn(async move {
                 let adapter_id = adapter.id.clone();
-                supervise_adapter(harness, store, adapter, drain).await;
+                supervise_adapter(harness, store, adapter, drain, attention_dir).await;
                 running
                     .lock()
                     .expect("adapter running set poisoned")
@@ -240,6 +248,7 @@ async fn announce_reboot(
     harness: Arc<dyn Harness>,
     store: AdapterStore,
     notice: RebootNotice,
+    attention_dir: Option<PathBuf>,
 ) -> Result<()> {
     let adapters = store.enabled_adapters().await?;
     let mut woken = HashSet::new();
@@ -278,13 +287,18 @@ async fn announce_reboot(
                 "failed to record host_reboot event"
             );
         }
-        send_conversation_wakeup(
-            conversation.as_ref(),
-            format!(
-                "Host services were restarted (reason: {reason}, requested at {requested_at}) and the adapter runner is back up. Adapter workers for {adapter_names} are reconnecting now. If you announced this reboot externally, or external users should know you are back, announce your return with send_adapter_message on the relevant adapters and targets; outbound messages queue durably and deliver once the adapter reconnects. If no announcement is appropriate, do nothing.",
-            ),
-        )
-        .await
+        let announcement = format!(
+            "Host services were restarted (reason: {reason}, requested at {requested_at}) and the adapter runner is back up. Adapter workers for {adapter_names} are reconnecting now. If you announced this reboot externally, or external users should know you are back, announce your return with send_adapter_message on the relevant adapters and targets; outbound messages queue durably and deliver once the adapter reconnects. If no announcement is appropriate, do nothing.",
+        );
+        match &attention_dir {
+            Some(dir) => {
+                let item = reboot_inbox_item(adapter, requested_at, announcement, now_ms());
+                deliver_via_inbox(dir, conversation.as_ref(), item).await
+            }
+            None => send_conversation_wakeup(conversation.as_ref(), announcement)
+                .await
+                .map(|_| ()),
+        }
         .with_context(|| {
             format!(
                 "reboot announcement wakeup failed for conversation {}",
@@ -295,11 +309,37 @@ async fn announce_reboot(
     Ok(())
 }
 
+/// Keyed on the reboot's requested-at timestamp, so one reboot announces once
+/// per conversation however many adapter groups share it — the append-side
+/// dedupe collapses the duplicates the `woken` set cannot see across groups.
+fn reboot_inbox_item(
+    adapter: &AdapterRecord,
+    requested_at: &str,
+    prompt: String,
+    now_ms: u64,
+) -> InboxItem {
+    InboxItem {
+        item_id: Uuid7::now(),
+        conversation_id: adapter.conversation_id.clone(),
+        producer: ProducerRef {
+            kind: ProducerKind::Adapter,
+            id: adapter.id.clone(),
+        },
+        dedupe_key: format!("host-reboot:{requested_at}"),
+        attention: Attention::Wake,
+        native: serde_json::Value::Null,
+        prompt,
+        artifacts: Vec::new(),
+        appended_at_ms: now_ms,
+    }
+}
+
 async fn supervise_adapter(
     harness: Arc<dyn Harness>,
     store: AdapterStore,
     adapter: AdapterRecord,
     drain: Arc<AtomicBool>,
+    attention_dir: Option<PathBuf>,
 ) {
     let mut restart_delay = INITIAL_RESTART_DELAY;
     loop {
@@ -329,6 +369,7 @@ async fn supervise_adapter(
             &store,
             adapter.clone(),
             Arc::clone(&drain),
+            attention_dir.clone(),
         )
         .await
         {
@@ -426,6 +467,7 @@ async fn run_adapter_loop(
     store: &AdapterStore,
     adapter: AdapterRecord,
     drain: Arc<AtomicBool>,
+    attention_dir: Option<PathBuf>,
 ) -> Result<()> {
     let agent = require_agent(harness.as_ref(), &adapter).await?;
     let conversation = require_conversation(agent.as_ref(), &adapter).await?;
@@ -438,6 +480,7 @@ async fn run_adapter_loop(
     let event_agent = std::sync::Arc::clone(&agent);
     let event_conversation = std::sync::Arc::clone(&conversation);
     let event_config = config.clone();
+    let event_attention_dir = attention_dir.clone();
     let outbound_store = store.clone();
     let outbound_adapter_id = adapter.id.clone();
     let stop_store = store.clone();
@@ -453,6 +496,7 @@ async fn run_adapter_loop(
             let agent = std::sync::Arc::clone(&event_agent);
             let conversation = std::sync::Arc::clone(&event_conversation);
             let config = event_config.clone();
+            let attention_dir = event_attention_dir.clone();
             async move {
                 handle_worker_event(
                     &store,
@@ -461,6 +505,7 @@ async fn run_adapter_loop(
                     &adapter,
                     &config,
                     event,
+                    attention_dir.as_deref(),
                 )
                 .await
             }
@@ -546,6 +591,7 @@ fn adapter_outbound_notifiers() -> &'static Mutex<HashMap<String, Weak<Notify>>>
     NOTIFIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_worker_event(
     store: &AdapterStore,
     agent: &dyn HarnessAgent,
@@ -553,6 +599,7 @@ async fn handle_worker_event(
     adapter: &AdapterRecord,
     config: &AdapterConfig,
     event: WorkerEvent,
+    attention_dir: Option<&Path>,
 ) -> Result<()> {
     match event {
         WorkerEvent::Connected { subject, metadata } => {
@@ -596,6 +643,7 @@ async fn handle_worker_event(
                 message_id,
                 metadata,
                 attachments,
+                attention_dir,
             )
             .await
         }
@@ -779,6 +827,7 @@ async fn handle_worker_message(
     message_id: Option<String>,
     metadata: serde_json::Value,
     attachments: Vec<AdapterAttachment>,
+    attention_dir: Option<&Path>,
 ) -> Result<()> {
     if let Some(message_id) = &message_id
         && !store
@@ -819,19 +868,53 @@ async fn handle_worker_message(
         &attachments,
         image_parts.len(),
     );
-    let content = if image_parts.is_empty() {
-        UserContent::String(prompt)
-    } else {
-        let mut parts = vec![UserContentPart::Text(TextContentPart {
-            text: prompt,
-            encrypted_content: None,
-            provider_options: None,
-            cache_control: None,
-        })];
-        parts.extend(image_parts);
-        UserContent::Array(parts)
+    // The attention path needs a platform message id (no id means no
+    // per-occurrence identity to dedupe on) and cannot yet carry content
+    // parts, so a message with inbound images takes the legacy multimodal
+    // wakeup even when the flag is set.
+    let wakeup_result = match (attention_dir, &message_id) {
+        (Some(dir), Some(message_id)) if image_parts.is_empty() => {
+            match inbox_item_from_adapter_message(
+                adapter,
+                AdapterInboundMessage {
+                    target: &target,
+                    sender: sender.as_deref(),
+                    message_id,
+                    text: &text,
+                    metadata: &metadata,
+                    attachments: &attachments,
+                },
+                Attention::Wake,
+                now_ms(),
+            ) {
+                Ok(mut item) => {
+                    // The wiring delivers the composed wakeup prompt, so the
+                    // agent-visible text is identical to the legacy path; the
+                    // raw platform text is embedded in it.
+                    item.prompt = prompt;
+                    deliver_via_inbox(dir, conversation, item).await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        _ => {
+            let content = if image_parts.is_empty() {
+                UserContent::String(prompt)
+            } else {
+                let mut parts = vec![UserContentPart::Text(TextContentPart {
+                    text: prompt,
+                    encrypted_content: None,
+                    provider_options: None,
+                    cache_control: None,
+                })];
+                parts.extend(image_parts);
+                UserContent::Array(parts)
+            };
+            send_conversation_wakeup_content(conversation, content)
+                .await
+                .map(|_| ())
+        }
     };
-    let wakeup_result = send_conversation_wakeup_content(conversation, content).await;
     // A failed model turn must not tear down the worker: the external
     // connection is healthy and dropping it loses every queued message.
     // Record the failure and keep processing events.
@@ -1108,6 +1191,33 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(claim_reboot_notice(Some(&path)).is_none());
         assert!(!path.exists(), "malformed notices are still consumed");
+    }
+
+    #[test]
+    fn reboot_items_dedupe_on_the_reboot_not_the_adapter() {
+        let mut second_adapter = test_adapter_record();
+        second_adapter.id = "adapter-2".to_string();
+        let first = reboot_inbox_item(
+            &test_adapter_record(),
+            "2026-06-09T19:39:02Z",
+            "back up".to_string(),
+            1_000,
+        );
+        let second = reboot_inbox_item(
+            &second_adapter,
+            "2026-06-09T19:39:02Z",
+            "back up".to_string(),
+            1_000,
+        );
+
+        // One reboot, two adapter groups on one conversation: the shared key
+        // collapses the announcements to one item.
+        assert_eq!(first.dedupe_key, "host-reboot:2026-06-09T19:39:02Z");
+        assert_eq!(first.dedupe_key, second.dedupe_key);
+        assert_eq!(first.producer.kind, ProducerKind::Adapter);
+        assert_eq!(first.producer.id, "adapter-1");
+        assert_eq!(first.attention, Attention::Wake);
+        assert_eq!(first.conversation_id, "conversation-1");
     }
 
     fn config_with_scope(scope: Option<&str>) -> AdapterConfig {
