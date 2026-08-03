@@ -49,6 +49,25 @@ pub async fn deliver_via_inbox(
     let backend: Arc<dyn AttentionBackend> = Arc::new(FileAttentionBackend::new(dir));
     let conversation_id = item.conversation_id.clone();
     backend.append_inbox_item(item).await?;
+    dispatch_conversation(&backend, conversation, &conversation_id).await
+}
+
+/// A dispatch pass with no append: drains whatever is already pending. The
+/// startup sweep for items stranded by a dispatcher that died holding the
+/// lease — an appender that found the lease taken has already returned, so
+/// without a sweep the item waits for the next append, which for a one-shot
+/// fire may never come.
+pub async fn sweep_via_inbox(dir: &Path, conversation: &dyn HarnessConversation) -> Result<()> {
+    let backend: Arc<dyn AttentionBackend> = Arc::new(FileAttentionBackend::new(dir));
+    let conversation_id = conversation.record().id.to_string();
+    dispatch_conversation(&backend, conversation, &conversation_id).await
+}
+
+async fn dispatch_conversation(
+    backend: &Arc<dyn AttentionBackend>,
+    conversation: &dyn HarnessConversation,
+    conversation_id: &str,
+) -> Result<()> {
     let mut open_turn = |items: Vec<InboxItem>| async move {
         // The dispatch lease is the serializer on this path — no wakeup file
         // lock, unlike `send_conversation_wakeup`.
@@ -63,7 +82,7 @@ pub async fn deliver_via_inbox(
         conversation.close_session(result.session_id).await?;
         Ok(())
     };
-    run_dispatch(&backend, &conversation_id, &mut open_turn).await
+    run_dispatch(backend, conversation_id, &mut open_turn).await
 }
 
 /// One item's prompt travels verbatim — parity with the single-wake behavior

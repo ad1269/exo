@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use exoharness::Uuid7;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 
 use super::backend::AttentionBackend;
 use super::types::{AppendOutcome, DispatchLease, InboxItem, InboxItemStatus, ItemId};
@@ -293,14 +292,38 @@ impl AttentionBackend for FileAttentionBackend {
             if !lease_expired(&held, now_ms()) {
                 return Ok(None);
             }
-            // Takeover: the rename is the atomic arbiter — of every process
-            // that saw the same expired lease, exactly one renames it away;
-            // the losers get NotFound and retry from the top.
+            // Takeover: rename the lease away, then CHECK what was renamed.
+            // The rename alone is not an arbiter — a slow loser can rename a
+            // fresh lease a faster winner already re-created — so the
+            // tombstone's token is compared against the expired token this
+            // process observed, and a stolen fresh lease is restored. The
+            // restore can itself race a third acquirer; that residual window
+            // is the read-then-write class renew already documents, and one
+            // of the reasons this backend is labeled deletable.
             let tombstone = lease_path.with_extension(format!("json.{}.tomb", Uuid7::now()));
             match fs::rename(&lease_path, &tombstone).await {
-                Ok(()) => fs::remove_file(&tombstone).await.with_context(|| {
-                    format!("failed to remove lease tombstone {}", tombstone.display())
-                })?,
+                Ok(()) => {
+                    let renamed = read_json_file::<LeaseRecord>(&tombstone).await?;
+                    let stole_fresh_lease =
+                        renamed.is_some_and(|renamed| renamed.token != held.token);
+                    if stole_fresh_lease {
+                        // Restore with link-then-unlink rather than rename:
+                        // link refuses an existing destination, so a third
+                        // acquirer's even-fresher lease is never clobbered.
+                        match fs::hard_link(&tombstone, &lease_path).await {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        fs::remove_file(&tombstone).await.with_context(|| {
+                            format!("failed to remove lease tombstone {}", tombstone.display())
+                        })?;
+                        continue;
+                    }
+                    fs::remove_file(&tombstone).await.with_context(|| {
+                        format!("failed to remove lease tombstone {}", tombstone.display())
+                    })?;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -372,25 +395,26 @@ pub(super) async fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Res
 }
 
 /// `O_EXCL` create; false when the file already existed.
+/// Create-if-absent with the content appearing atomically: the record is
+/// written to a temp file and hard-linked into place. A bare `O_EXCL` create
+/// followed by a write has a birth window where a concurrent reader sees an
+/// empty file; the link makes the file exist only in its full form.
 async fn create_json_file_once<T: Serialize>(path: &Path, value: &T) -> Result<bool> {
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    let temp_path = path.with_extension(format!("json.{}.tmp", Uuid7::now()));
+    fs::write(&temp_path, serde_json::to_vec_pretty(value)?)
         .await
-    {
-        Ok(mut file) => {
-            file.write_all(&serde_json::to_vec_pretty(value)?)
-                .await
-                .with_context(|| format!("failed to write {}", path.display()))?;
-            file.flush()
-                .await
-                .with_context(|| format!("failed to flush {}", path.display()))?;
-            Ok(true)
+        .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
+    let created = match fs::hard_link(&temp_path, path).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", path.display()));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
-    }
+    };
+    fs::remove_file(&temp_path)
+        .await
+        .with_context(|| format!("failed to remove temp file {}", temp_path.display()))?;
+    Ok(created)
 }
 
 async fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {

@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::agent_sandbox::ensure_agent_sandbox;
 use crate::attention::{Attention, inbox_item_from_fire};
-use crate::attention_dispatch::{attention_dir_from_env, deliver_via_inbox};
+use crate::attention_dispatch::{attention_dir_from_env, deliver_via_inbox, sweep_via_inbox};
 use crate::conversation_sandbox::{create_conversation_sandbox, ensure_conversation_sandbox};
 use crate::conversation_wakeup::send_conversation_wakeup;
 use crate::scheduler_store::SchedulerStore;
@@ -76,6 +76,9 @@ pub async fn redeliver_pending_wakes(
     store: &SchedulerStore,
 ) -> Result<usize> {
     let attention_dir = attention_dir_from_env();
+    if let Some(dir) = attention_dir.as_deref() {
+        sweep_task_conversations(Arc::clone(&harness), store, dir).await?;
+    }
     let mut delivered = 0;
     for fire in store.pending_fires().await? {
         let Some(agent) = harness.get_agent(&fire.agent_id).await? else {
@@ -121,6 +124,31 @@ async fn deliver_fire_wakeup(
             Ok(())
         }
     }
+}
+
+/// Startup sweep over every task's conversation. An item appended while
+/// another dispatcher held the lease strands if that dispatcher died: its
+/// fire is already marked delivered, so redelivery will never revisit it,
+/// and nothing else dispatches a conversation nobody appends to.
+async fn sweep_task_conversations(
+    harness: Arc<dyn Harness>,
+    store: &SchedulerStore,
+    dir: &Path,
+) -> Result<()> {
+    let mut swept = std::collections::HashSet::new();
+    for task in store.list_tasks().await? {
+        if !swept.insert((task.agent_id.clone(), task.conversation_id.clone())) {
+            continue;
+        }
+        let Some(agent) = harness.get_agent(&task.agent_id).await? else {
+            continue;
+        };
+        let Some(conversation) = agent.get_conversation(&task.conversation_id).await? else {
+            continue;
+        };
+        sweep_via_inbox(dir, conversation.as_ref()).await?;
+    }
+    Ok(())
 }
 
 /// Runs whatever the task's missed-fire policy says it owes at this moment,

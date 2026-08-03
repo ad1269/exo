@@ -181,6 +181,55 @@ async fn a_fresh_acquire_re_pends_items_a_previous_holder_left_drained() {
     assert_eq!(pending[0].item_id, orphan.item_id);
 }
 
+// Every process saw the same expired lease; at most one may end up holding.
+// The steal-then-restore in acquire is what this pins: without it a slow
+// loser renames away the winner's fresh lease and a second dispatcher runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_takeovers_of_one_expired_lease_grant_at_most_one_winner() {
+    for _ in 0..8 {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(CONVERSATION))
+            .await
+            .expect("create conversation dir");
+        write_json_file(
+            &dir.path().join(CONVERSATION).join("lease.json"),
+            &LeaseRecord {
+                conversation_id: CONVERSATION.to_string(),
+                token: Uuid7::now().to_string(),
+                holder_pid: 0,
+                expires_at_ms: 1,
+            },
+        )
+        .await
+        .expect("write expired lease");
+
+        let acquires = (0..4).map(|_| {
+            let path = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                FileAttentionBackend::new(path)
+                    .acquire_dispatch_lease(CONVERSATION)
+                    .await
+                    .expect("acquire")
+            })
+        });
+        let mut winners = Vec::new();
+        for acquire in acquires.collect::<Vec<_>>() {
+            if let Some(lease) = acquire.await.expect("join") {
+                winners.push(lease);
+            }
+        }
+        assert_eq!(winners.len(), 1, "exactly one racer may take the lease");
+        // The survivor's token is the one on disk: its renew must succeed.
+        let survivor = FileAttentionBackend::new(dir.path());
+        assert!(
+            survivor
+                .renew_dispatch_lease(&winners[0])
+                .await
+                .expect("renew")
+        );
+    }
+}
+
 #[test]
 fn a_lease_expires_strictly_after_its_deadline() {
     let record = LeaseRecord {

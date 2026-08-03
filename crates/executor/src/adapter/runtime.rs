@@ -24,7 +24,7 @@ use crate::attention::{
     AdapterInboundMessage, Attention, InboxItem, ProducerKind, ProducerRef,
     inbox_item_from_adapter_message,
 };
-use crate::attention_dispatch::{attention_dir_from_env, deliver_via_inbox};
+use crate::attention_dispatch::{attention_dir_from_env, deliver_via_inbox, sweep_via_inbox};
 use crate::conversation_events::{
     HOST_EVENT_ADAPTER_RUNNER_DRAINING, HOST_EVENT_ADAPTER_RUNNER_STARTED, HOST_EVENT_REBOOT,
     record_host_event,
@@ -471,6 +471,18 @@ async fn run_adapter_loop(
 ) -> Result<()> {
     let agent = require_agent(harness.as_ref(), &adapter).await?;
     let conversation = require_conversation(agent.as_ref(), &adapter).await?;
+    if let Some(dir) = &attention_dir {
+        // Items stranded by a dispatcher that died holding the lease get
+        // their pass here; an appender that found the lease taken already
+        // returned and will not come back for them.
+        if let Err(error) = sweep_via_inbox(dir, conversation.as_ref()).await {
+            tracing::error!(
+                adapter_id = %adapter.id,
+                %error,
+                "attention sweep failed at adapter startup"
+            );
+        }
+    }
     store.requeue_inflight_messages(&adapter.id).await?;
     let config = adapter.config.clone();
     let secret_env = worker_secret_env(agent.exoharness_handle().as_ref(), &config).await?;
