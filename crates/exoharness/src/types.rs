@@ -695,6 +695,10 @@ impl EventData {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkRepresentation {
+    /// Documentary, not a live code path: legacy re-minted forks carry no
+    /// marker at all (absent field), and nothing constructs `Copied` today.
+    /// It names the shape a future copy-on-compact materializer would stamp
+    /// when it turns a referenced fork self-contained.
     Copied,
     Referenced,
 }

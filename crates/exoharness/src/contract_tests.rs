@@ -1529,6 +1529,45 @@ pub async fn fork_by_reference_preserves_identity_and_scopes_authority(
     let mid_events = mid_fork.get_events(None).await.expect("mid read").events;
     // Prefix ends exactly at the cut; the tail is the anchor.
     assert_eq!(mid_events[mid_events.len() - 2].id, mid);
+
+    // REGRESSION (review reject, ENG-1352): both axes crossed — a REFERENCED
+    // parent forked at a cut INSIDE its inherited range. The cut sits below
+    // the parent's own anchor, so a bound-filter applied before reading the
+    // anchor would drop the reference and silently lose the whole upstream
+    // prefix.
+    let inherited_cut = mid_events[1].id;
+    assert!(
+        inherited_cut < mid_events[mid_events.len() - 1].id,
+        "the cut must precede the referenced parent's anchor"
+    );
+    let deep = mid_fork
+        .fork(ForkConversationRequest {
+            up_to_inclusive: Some(inherited_cut),
+            ..Default::default()
+        })
+        .await
+        .expect("fork inside the inherited range");
+    let deep_events = deep.get_events(None).await.expect("deep read").events;
+    assert_eq!(
+        deep_events[..deep_events.len() - 1]
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        mid_events
+            .iter()
+            .filter(|event| event.id <= inherited_cut)
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        "the upstream prefix survives a cut below the parent's anchor"
+    );
+    assert!(
+        deep_events.len() > 1,
+        "the composed journal is more than the anchor"
+    );
+    assert!(
+        deep_events.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "order holds through the doubly nested composition"
+    );
 }
 
 pub async fn conversation_scope_overrides_agent_scope_and_fork_copies_bindings(

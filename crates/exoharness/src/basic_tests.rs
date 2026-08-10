@@ -601,6 +601,64 @@ async fn basic_backend_fork_anchor_survives_restart() {
     assert_eq!(before, after, "the composed journal is restart-stable");
 }
 
+// A referenced anchor without a pinned cursor is a corrupted journal — the
+// prefix it names is unbounded — and reads must fail loudly, not resolve.
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_a_cursorless_referenced_anchor_is_refused() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let created = conversation
+        .get_events(None)
+        .await
+        .expect("events")
+        .events
+        .pop()
+        .expect("thread created event");
+    // Plant a corrupted anchor BELOW the creation event so it is the
+    // journal's first event.
+    let anchor_id = Uuid7::from(uuid::Uuid::from_u128(created.id.0.as_u128() - 1));
+    let events_dir = find_events_dir(tempdir.path(), &created.id.to_string());
+    let corrupted = Event {
+        id: anchor_id,
+        thread_id: conversation.record().id,
+        session_id: None,
+        turn_id: None,
+        created_at: created.created_at,
+        data: EventData::ThreadForked {
+            source_thread_id: Uuid7::now(),
+            up_to_inclusive: None,
+            representation: Some(crate::ForkRepresentation::Referenced),
+        },
+    };
+    std::fs::write(
+        events_dir.join(format!("{anchor_id}.json")),
+        serde_json::to_vec_pretty(&corrupted).expect("serialize"),
+    )
+    .expect("plant corrupted anchor");
+
+    let error = conversation
+        .get_events(None)
+        .await
+        .expect_err("a cursorless referenced anchor must not resolve");
+    assert!(
+        error.to_string().contains("lacks a pinned cursor"),
+        "the failure names the corruption: {error}"
+    );
+}
+
 // Journals from before fork-by-reference carry a marker-less ThreadForked
 // over re-minted copies; they must read exactly as the self-contained
 // streams they are — no reference resolution attempted.

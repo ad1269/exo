@@ -4501,9 +4501,14 @@ async fn load_composed_prefix(
         .join(conversation_id.to_string())
         .join("events");
     let mut events = load_events(storage, &events_dir).await?;
+    // The anchor must be read BEFORE the bound filter: a cut inside this
+    // thread's inherited range lies below the anchor's own id, and filtering
+    // first would drop the anchor — and with it the entire upstream prefix.
+    // The anchor event itself is rightly excluded from the output when it
+    // lies beyond the bound; only its reference must survive.
+    let anchor = events.first().map(referenced_parent).transpose()?.flatten();
     events.retain(|event| event.id <= bound);
-    let Some((parent, cursor)) = events.first().map(referenced_parent).transpose()?.flatten()
-    else {
+    let Some((parent, cursor)) = anchor else {
         return Ok(events);
     };
     let mut composed = Box::pin(load_composed_prefix(
