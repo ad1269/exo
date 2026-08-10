@@ -2,15 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AddEventsRequest, AddEventsResult, AgentId, AgentRecord, Artifact, ArtifactVersion,
-    AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
-    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationId,
-    CreateSandboxRequest, Event, EventData, EventId, EventQuery, ForkConversationRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
-    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId, TurnRecord,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    AttachSandboxRequest, BeginOperationRequest, BeginOperationResult, BeginTurnRequest, Binding,
+    BindingId, BindingRecord, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
+    CompleteOperationRequest, ConversationId, CreateSandboxRequest, Event, EventData, EventId,
+    EventQuery, ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    OperationRecord, PutSecretRequest, ReadArtifactRequest, SandboxAttachment, SandboxId,
+    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
+    SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    ThreadRecord, TurnId, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,6 +227,20 @@ pub enum Request {
         conversation_id: ConversationId,
         request: AddEventsRequest,
     },
+    ConversationBeginOperation {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+        request: BeginOperationRequest,
+    },
+    ConversationCompleteOperation {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+        request: CompleteOperationRequest,
+    },
+    ConversationOpenOperations {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+    },
     ConversationFork {
         agent_id: AgentId,
         conversation_id: ConversationId,
@@ -339,6 +354,9 @@ impl Request {
             Self::ConversationGetEvents { .. } => "conversation_get_events",
             Self::ConversationGetEvent { .. } => "conversation_get_event",
             Self::ConversationAddEvents { .. } => "conversation_add_events",
+            Self::ConversationBeginOperation { .. } => "conversation_begin_operation",
+            Self::ConversationCompleteOperation { .. } => "conversation_complete_operation",
+            Self::ConversationOpenOperations { .. } => "conversation_open_operations",
             Self::ConversationFork { .. } => "conversation_fork",
             Self::ConversationListArtifacts { .. } => "conversation_list_artifacts",
             Self::ConversationReadArtifact { .. } => "conversation_read_artifact",
@@ -382,6 +400,15 @@ pub enum Response {
     },
     AddEvents {
         result: AddEventsResult,
+    },
+    BeginOperation {
+        result: BeginOperationResult,
+    },
+    Operation {
+        operation: OperationRecord,
+    },
+    Operations {
+        operations: Vec<OperationRecord>,
     },
     SessionId {
         session_id: SessionId,
@@ -451,6 +478,9 @@ impl Response {
             Self::Events { .. } => "events",
             Self::Event { .. } => "event",
             Self::AddEvents { .. } => "add_events",
+            Self::BeginOperation { .. } => "begin_operation",
+            Self::Operation { .. } => "operation",
+            Self::Operations { .. } => "operations",
             Self::SessionId { .. } => "session_id",
             Self::ArtifactVersions { .. } => "artifact_versions",
             Self::Artifact { .. } => "artifact",

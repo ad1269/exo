@@ -33,20 +33,22 @@ use crate::secrets::{
 use crate::storage::BasicObjectStore;
 use crate::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
-    BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
-    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
-    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
-    SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
-    SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata,
-    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    ArtifactVersion, AttachSandboxRequest, BeginOperationRequest, BeginOperationResult,
+    BeginTurnRequest, Binding, BindingId, BindingRecord, BindingType, BoxAsyncRead, BoxAsyncWrite,
+    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, CompleteOperationRequest,
+    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest,
+    DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
+    EventStream, ExoHarness, FileSystemMount, ForkConversationRequest, GetEventsResult,
+    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
+    NewAgentRequest, NewConversationRequest, OperationOutcome, OperationRecord, OperationState,
+    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret,
+    SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    fold_operations,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1244,6 +1246,7 @@ impl AgentHandle for BasicAgentHandle {
             None,
             None,
             None,
+            false,
             vec![EventData::ThreadCreated {
                 slug: record.slug.clone(),
                 name: record.name.clone(),
@@ -1290,6 +1293,7 @@ impl AgentHandle for BasicAgentHandle {
                 None,
                 None,
                 record.latest_event_id,
+                false,
                 vec![EventData::ThreadDeleted],
                 &mut record,
             )
@@ -2138,6 +2142,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     None,
                     None,
                     record.latest_event_id,
+                    false,
                     data,
                     &mut record,
                 )
@@ -2169,6 +2174,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     Some(session_id),
                     Some(turn_id),
                     expected_head,
+                    false,
                     data,
                     &mut record,
                 )
@@ -2247,6 +2253,7 @@ impl ConversationHandle for BasicConversationHandle {
             Some(session_id),
             Some(turn_record.id),
             record.latest_event_id,
+            false,
             events_to_append,
             &mut record,
         )
@@ -2369,8 +2376,114 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult> {
+        ensure_no_operation_events(&request.data)?;
         self.append_events_internal(request.session_id, request.turn_id, None, request.data)
             .await
+    }
+
+    async fn begin_operation(
+        &self,
+        request: BeginOperationRequest,
+    ) -> Result<BeginOperationResult> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let operations = fold_operations(&events);
+        let prior = operations
+            .iter()
+            .rev()
+            .find(|operation| operation.idempotency_key == request.idempotency_key);
+        let supersedes = match prior {
+            Some(prior) if prior.effect_kind != request.effect_kind => bail!(
+                "idempotency key {:?} belongs to effect kind {:?}, not {:?}",
+                request.idempotency_key,
+                prior.effect_kind,
+                request.effect_kind
+            ),
+            Some(prior) if prior.state != OperationState::Failed => {
+                return Ok(BeginOperationResult {
+                    operation: prior.clone(),
+                    created: false,
+                });
+            }
+            // A terminally failed operation releases its key: the retry is a
+            // new operation, but it keeps the key so the destination still
+            // deduplicates against the failed run's attempts.
+            Some(prior) => Some(prior.operation_id),
+            None => None,
+        };
+        let operation_id = Uuid7::now();
+        let add_result = self
+            .append_operation_event_locked(EventData::OperationIntent {
+                operation_id,
+                effect_kind: request.effect_kind.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+                recovery_policy: request.recovery_policy,
+                budget: request.budget.clone(),
+                supersedes,
+            })
+            .await?;
+        Ok(BeginOperationResult {
+            operation: OperationRecord {
+                operation_id,
+                effect_kind: request.effect_kind,
+                idempotency_key: request.idempotency_key,
+                recovery_policy: request.recovery_policy,
+                budget: request.budget,
+                supersedes,
+                intent_event_id: add_result.latest_event_id,
+                state: OperationState::Open,
+                detail: None,
+                completion_event_id: None,
+            },
+            created: true,
+        })
+    }
+
+    async fn complete_operation(
+        &self,
+        request: CompleteOperationRequest,
+    ) -> Result<OperationRecord> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut operation = fold_operations(&events)
+            .into_iter()
+            .find(|operation| operation.operation_id == request.operation_id)
+            .ok_or_else(|| anyhow!("unknown operation {}", request.operation_id))?;
+        let requested: OperationState = request.outcome.into();
+        if operation.state == requested {
+            return Ok(operation);
+        }
+        if operation.state.is_terminal() {
+            if request.outcome == OperationOutcome::Uncertain {
+                // A replayed "may have run" adds nothing to a settled outcome.
+                return Ok(operation);
+            }
+            bail!(
+                "operation {} already settled as {:?}; refusing conflicting outcome {:?}",
+                operation.operation_id,
+                operation.state,
+                request.outcome
+            );
+        }
+        let add_result = self
+            .append_operation_event_locked(EventData::OperationCompleted {
+                operation_id: request.operation_id,
+                outcome: request.outcome,
+                detail: request.detail.clone(),
+            })
+            .await?;
+        operation.state = requested;
+        operation.detail = request.detail;
+        operation.completion_event_id = Some(add_result.latest_event_id);
+        Ok(operation)
+    }
+
+    async fn open_operations(&self) -> Result<Vec<OperationRecord>> {
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        Ok(fold_operations(&events)
+            .into_iter()
+            .filter(|operation| !operation.state.is_terminal())
+            .collect())
     }
 
     async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
@@ -2460,6 +2573,7 @@ impl ConversationHandle for BasicConversationHandle {
             None,
             None,
             fork_record.latest_event_id,
+            false,
             vec![EventData::ThreadForked {
                 source_thread_id: self.record.id,
                 up_to_inclusive: request.up_to_inclusive,
@@ -2492,6 +2606,7 @@ impl ConversationHandle for BasicConversationHandle {
             None,
             None,
             record.latest_event_id,
+            false,
             vec![EventData::ArtifactWritten {
                 artifact_id: artifact_version.artifact_id,
                 path: artifact_version.path.clone(),
@@ -2708,6 +2823,31 @@ impl BasicConversationHandle {
             .await
     }
 
+    /// Caller must hold `write_lock`: the fold that justified this append and
+    /// the append itself have to see the same log.
+    async fn append_operation_event_locked(&self, data: EventData) -> Result<AddEventsResult> {
+        let conversation_dir = self.conversation_dir();
+        let mut record = self.load_record().await?;
+        let add_result = append_events_to_conversation(
+            &self.harness.inner,
+            &conversation_dir,
+            self.record.id,
+            None,
+            None,
+            record.latest_event_id,
+            true,
+            vec![data],
+            &mut record,
+        )
+        .await?;
+        self.harness
+            .inner
+            .storage
+            .put_json(conversation_dir.join("record.json"), &record)
+            .await?;
+        Ok(add_result)
+    }
+
     async fn append_events_internal(
         &self,
         session_id: Option<SessionId>,
@@ -2725,6 +2865,7 @@ impl BasicConversationHandle {
             session_id,
             turn_id,
             expected_head,
+            false,
             data,
             &mut record,
         )
@@ -3205,6 +3346,7 @@ impl TurnHandle for BasicTurnHandle {
     }
 
     async fn add_events(&self, data: Vec<EventData>) -> Result<AddEventsResult> {
+        ensure_no_operation_events(&data)?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let mut record = self
             .harness
@@ -3220,6 +3362,7 @@ impl TurnHandle for BasicTurnHandle {
             Some(self.record.session_id),
             Some(self.record.id),
             expected_head,
+            false,
             data,
             &mut record,
         )
@@ -3258,6 +3401,7 @@ impl TurnHandle for BasicTurnHandle {
             Some(self.record.session_id),
             Some(self.record.id),
             expected_head,
+            false,
             vec![EventData::ArtifactWritten {
                 artifact_id: artifact_version.artifact_id,
                 path: artifact_version.path.clone(),
@@ -3302,6 +3446,7 @@ impl TurnHandle for BasicTurnHandle {
             Some(self.record.session_id),
             Some(self.record.id),
             expected_head,
+            false,
             vec![EventData::TurnEnded],
             &mut record,
         )
@@ -3767,6 +3912,7 @@ async fn append_sandbox_process_data(
         None,
         None,
         record.latest_event_id,
+        false,
         data,
         &mut record,
     )
@@ -3888,6 +4034,7 @@ async fn append_events_to_conversation(
     session_id: Option<SessionId>,
     turn_id: Option<TurnId>,
     expected_head: Option<EventId>,
+    durable: bool,
     data: Vec<EventData>,
     record: &mut ConversationRecord,
 ) -> Result<AddEventsResult> {
@@ -3914,15 +4061,13 @@ async fn append_events_to_conversation(
             created_at: id.timestamp().expect("uuid7 timestamp"),
             data,
         };
-        inner
-            .storage
-            .put_json(
-                conversation_dir
-                    .join("events")
-                    .join(format!("{}.json", event.id)),
-                &event,
-            )
-            .await?;
+        let event_path = conversation_dir
+            .join("events")
+            .join(format!("{}.json", event.id));
+        match durable {
+            true => inner.storage.put_json_durable(event_path, &event).await?,
+            false => inner.storage.put_json(event_path, &event).await?,
+        }
         notify_subscribers(inner, conversation_id, event.clone());
         latest_event_id = Some(event.id);
         event_ids.push(event.id);
@@ -3933,6 +4078,21 @@ async fn append_events_to_conversation(
         event_ids,
         latest_event_id,
     })
+}
+
+/// Operation events are minted only by `begin_operation` and
+/// `complete_operation` — the dedupe and conflict checks live there, so a
+/// direct append would be an unchecked journal write.
+fn ensure_no_operation_events(data: &[EventData]) -> Result<()> {
+    for event in data {
+        if matches!(
+            event,
+            EventData::OperationIntent { .. } | EventData::OperationCompleted { .. }
+        ) {
+            bail!("operation events are kernel-minted; use begin_operation and complete_operation");
+        }
+    }
+    Ok(())
 }
 
 fn ensure_conversation_head(

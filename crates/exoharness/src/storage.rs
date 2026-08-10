@@ -16,6 +16,7 @@ use crate::Result;
 #[derive(Clone)]
 pub(crate) struct BasicObjectStore {
     store: Arc<dyn ObjectStore>,
+    root: PathBuf,
 }
 
 impl BasicObjectStore {
@@ -25,7 +26,23 @@ impl BasicObjectStore {
         let store = LocalFileSystem::new_with_prefix(&root)?;
         Ok(Self {
             store: Arc::new(store),
+            root,
         })
+    }
+
+    /// `put_json` that survives a crash: the object store's local put stages
+    /// and renames but never syncs, so this writes directly — temp file,
+    /// `sync_all` (F_FULLFSYNC on macOS), rename, then parent-directory fsync
+    /// so the rename itself is on disk. For records whose existence is a
+    /// promise, like operation intents.
+    pub(crate) async fn put_json_durable<T: Serialize>(
+        &self,
+        key: impl AsRef<Path>,
+        value: &T,
+    ) -> Result<()> {
+        let path = self.root.join(normalize_path(key.as_ref()));
+        let bytes = serde_json::to_vec_pretty(value)?;
+        tokio::task::spawn_blocking(move || write_durable(&path, &bytes)).await?
     }
 
     pub(crate) async fn put_json<T: Serialize>(
@@ -163,6 +180,32 @@ impl BasicObjectStore {
         }
         Ok(values)
     }
+}
+
+fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .with_context(|| format!("durable write target has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("durable write target has no file name: {}", path.display()))?;
+    let temporary = parent.join(format!("{file_name}.tmp.{}", std::process::id()));
+    let mut file = std::fs::File::create(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    drop(file);
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("failed to rename into {}", path.display()))?;
+    std::fs::File::open(parent)?
+        .sync_all()
+        .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+    Ok(())
 }
 
 fn object_path(path: &Path) -> Result<ObjectPath> {

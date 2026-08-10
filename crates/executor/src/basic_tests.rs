@@ -1030,6 +1030,24 @@ impl ConversationHandle for FakeConversationHandle {
         })
     }
 
+    async fn begin_operation(
+        &self,
+        _request: exoharness::BeginOperationRequest,
+    ) -> Result<exoharness::BeginOperationResult> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn complete_operation(
+        &self,
+        _request: exoharness::CompleteOperationRequest,
+    ) -> Result<exoharness::OperationRecord> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn open_operations(&self) -> Result<Vec<exoharness::OperationRecord>> {
+        Ok(Vec::new())
+    }
+
     async fn fork(&self, _request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
         Err(anyhow!("not implemented"))
     }

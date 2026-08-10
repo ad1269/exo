@@ -138,6 +138,25 @@ pub trait ThreadHandle: SandboxHandle {
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult>;
     async fn fork(&self, request: ForkThreadRequest) -> Result<Arc<dyn ThreadHandle>>;
 
+    /// Durably records intent to perform an effect, deduplicating on the
+    /// idempotency key: an open, uncertain, or succeeded operation under the
+    /// same key is returned instead of a new record (`created: false`), so a
+    /// replayed caller skips or resumes rather than re-deciding. A failed
+    /// operation's key may be reused — the new record supersedes it.
+    async fn begin_operation(&self, request: BeginOperationRequest)
+    -> Result<BeginOperationResult>;
+    /// Records how an operation's effect settled. Idempotent for a matching
+    /// outcome; `uncertain` is absorbed by an existing terminal outcome;
+    /// conflicting terminal outcomes are an error.
+    async fn complete_operation(
+        &self,
+        request: CompleteOperationRequest,
+    ) -> Result<OperationRecord>;
+    /// Operations not yet terminally settled — open (known not run) and
+    /// uncertain (may have run) — the reconcile list a recovering executor
+    /// works through.
+    async fn open_operations(&self) -> Result<Vec<OperationRecord>>;
+
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>>;
@@ -298,6 +317,8 @@ impl EventKind {
     pub const SANDBOX_PROCESS_STATE_UPDATED: EventKind =
         EventKind(Cow::Borrowed("sandbox_process_state_updated"));
     pub const SANDBOX_PROCESS_EVENT: EventKind = EventKind(Cow::Borrowed("sandbox_process_event"));
+    pub const OPERATION_INTENT: EventKind = EventKind(Cow::Borrowed("operation_intent"));
+    pub const OPERATION_COMPLETED: EventKind = EventKind(Cow::Borrowed("operation_completed"));
 
     pub fn custom(name: impl Into<Cow<'static, str>>) -> Self {
         Self(name.into())
@@ -513,6 +534,22 @@ pub enum EventData {
         process_id: SandboxProcessId,
         event: SandboxProcessEvent,
     },
+    OperationIntent {
+        operation_id: OperationId,
+        effect_kind: String,
+        idempotency_key: String,
+        recovery_policy: RecoveryPolicy,
+        #[serde(default)]
+        budget: RecoveryBudget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supersedes: Option<OperationId>,
+    },
+    OperationCompleted {
+        operation_id: OperationId,
+        outcome: OperationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     Custom {
         event_type: String,
         payload: Value,
@@ -547,9 +584,175 @@ impl EventData {
             Self::SandboxProcessStarted { .. } => EventKind::SANDBOX_PROCESS_STARTED,
             Self::SandboxProcessStateUpdated { .. } => EventKind::SANDBOX_PROCESS_STATE_UPDATED,
             Self::SandboxProcessEvent { .. } => EventKind::SANDBOX_PROCESS_EVENT,
+            Self::OperationIntent { .. } => EventKind::OPERATION_INTENT,
+            Self::OperationCompleted { .. } => EventKind::OPERATION_COMPLETED,
             Self::Custom { event_type, .. } => EventKind::custom(event_type.clone()),
         }
     }
+}
+
+pub type OperationId = Uuid7;
+
+/// What recovery may do with this operation after a crash, chosen by the
+/// caller at intent time. The kernel carries the policy; acting on it is
+/// userspace's job.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPolicy {
+    /// Safe to re-run under the same idempotency key.
+    Retry,
+    /// May have run: check the destination before retrying.
+    Reconcile,
+    /// Undo via a compensating effect rather than retrying.
+    Compensate,
+    /// Irreversible: hand to a human or supervisor.
+    Escalate,
+}
+
+/// Ceilings recovery must respect. Carried on the record, enforced by
+/// whatever drives recovery — never by the kernel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RecoveryBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTimeUtc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationOutcome {
+    Succeeded,
+    Failed,
+    /// The attempt ended without learning whether the effect landed. Not
+    /// terminal: the operation stays on the reconcile list until a later
+    /// completion settles it.
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Open,
+    Uncertain,
+    Succeeded,
+    Failed,
+}
+
+impl OperationState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+}
+
+impl From<OperationOutcome> for OperationState {
+    fn from(outcome: OperationOutcome) -> Self {
+        match outcome {
+            OperationOutcome::Succeeded => Self::Succeeded,
+            OperationOutcome::Failed => Self::Failed,
+            OperationOutcome::Uncertain => Self::Uncertain,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BeginOperationRequest {
+    pub effect_kind: String,
+    /// The key the effect's destination deduplicates on. Scoped to the
+    /// effect kind by the caller; a key may outlive one operation record
+    /// (a superseding retry reuses it so the destination still dedupes).
+    pub idempotency_key: String,
+    pub recovery_policy: RecoveryPolicy,
+    #[serde(default)]
+    pub budget: RecoveryBudget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompleteOperationRequest {
+    pub operation_id: OperationId,
+    pub outcome: OperationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationRecord {
+    pub operation_id: OperationId,
+    pub effect_kind: String,
+    pub idempotency_key: String,
+    pub recovery_policy: RecoveryPolicy,
+    pub budget: RecoveryBudget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<OperationId>,
+    pub intent_event_id: EventId,
+    pub state: OperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_event_id: Option<EventId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BeginOperationResult {
+    pub operation: OperationRecord,
+    /// False when an existing record under the same idempotency key was
+    /// returned instead of a new intent being written.
+    pub created: bool,
+}
+
+/// Replays operation events into current records, in event order. Total over
+/// any event sequence: completions for unknown operations are dropped, and a
+/// terminal state only changes by this fold never — later completions that
+/// disagree were already rejected at the API.
+pub fn fold_operations(events: &[Event]) -> Vec<OperationRecord> {
+    let mut operations: Vec<OperationRecord> = Vec::new();
+    for event in events {
+        match &event.data {
+            EventData::OperationIntent {
+                operation_id,
+                effect_kind,
+                idempotency_key,
+                recovery_policy,
+                budget,
+                supersedes,
+            } => operations.push(OperationRecord {
+                operation_id: *operation_id,
+                effect_kind: effect_kind.clone(),
+                idempotency_key: idempotency_key.clone(),
+                recovery_policy: *recovery_policy,
+                budget: budget.clone(),
+                supersedes: *supersedes,
+                intent_event_id: event.id,
+                state: OperationState::Open,
+                detail: None,
+                completion_event_id: None,
+            }),
+            EventData::OperationCompleted {
+                operation_id,
+                outcome,
+                detail,
+            } => {
+                let Some(operation) = operations
+                    .iter_mut()
+                    .find(|operation| operation.operation_id == *operation_id)
+                else {
+                    continue;
+                };
+                if operation.state.is_terminal() {
+                    continue;
+                }
+                operation.state = (*outcome).into();
+                operation.detail = detail.clone();
+                operation.completion_event_id = Some(event.id);
+            }
+            _ => {}
+        }
+    }
+    operations
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

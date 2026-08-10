@@ -748,6 +748,24 @@ impl ConversationHandle for LocalSandboxConversation {
         self.remote.add_events(request).await
     }
 
+    async fn begin_operation(
+        &self,
+        request: exoharness::BeginOperationRequest,
+    ) -> Result<exoharness::BeginOperationResult> {
+        self.remote.begin_operation(request).await
+    }
+
+    async fn complete_operation(
+        &self,
+        request: exoharness::CompleteOperationRequest,
+    ) -> Result<exoharness::OperationRecord> {
+        self.remote.complete_operation(request).await
+    }
+
+    async fn open_operations(&self) -> Result<Vec<exoharness::OperationRecord>> {
+        self.remote.open_operations().await
+    }
+
     async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
         let remote = self.remote.fork(request).await?;
         Ok(wrap_conversation(Arc::clone(&self.state), remote))

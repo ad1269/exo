@@ -18,17 +18,18 @@ use crate::protocol::{
 };
 use crate::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
-    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventId,
-    EventQuery, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    ArtifactVersion, AttachSandboxRequest, BeginOperationRequest, BeginOperationResult,
+    BeginTurnRequest, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
+    CloseSandboxProcessInputRequest, CompleteOperationRequest, ConversationHandle, ConversationId,
+    ConversationRecord, CreateSandboxRequest, Event, EventData, EventId, EventQuery, EventStream,
+    ExoHarness, ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    OperationRecord, PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest,
+    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
+    SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
+    SecretMetadata, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, TurnHandle, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 #[derive(Clone)]
@@ -869,6 +870,56 @@ impl ConversationHandle for HttpConversationHandle {
         {
             Response::AddEvents { result } => Ok(result),
             response => unexpected_response(response, "add_events"),
+        }
+    }
+
+    async fn begin_operation(
+        &self,
+        request: BeginOperationRequest,
+    ) -> Result<BeginOperationResult> {
+        match self
+            .harness
+            .request(Request::ConversationBeginOperation {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::BeginOperation { result } => Ok(result),
+            response => unexpected_response(response, "begin_operation"),
+        }
+    }
+
+    async fn complete_operation(
+        &self,
+        request: CompleteOperationRequest,
+    ) -> Result<OperationRecord> {
+        match self
+            .harness
+            .request(Request::ConversationCompleteOperation {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::Operation { operation } => Ok(operation),
+            response => unexpected_response(response, "operation"),
+        }
+    }
+
+    async fn open_operations(&self) -> Result<Vec<OperationRecord>> {
+        match self
+            .harness
+            .request(Request::ConversationOpenOperations {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+            })
+            .await?
+        {
+            Response::Operations { operations } => Ok(operations),
+            response => unexpected_response(response, "operations"),
         }
     }
 

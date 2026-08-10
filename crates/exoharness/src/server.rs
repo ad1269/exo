@@ -288,6 +288,35 @@ impl ExoHarnessServer {
                     result: conversation.add_events(request).await?,
                 })
             }
+            Request::ConversationBeginOperation {
+                agent_id,
+                conversation_id,
+                request,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::BeginOperation {
+                    result: conversation.begin_operation(request).await?,
+                })
+            }
+            Request::ConversationCompleteOperation {
+                agent_id,
+                conversation_id,
+                request,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::Operation {
+                    operation: conversation.complete_operation(request).await?,
+                })
+            }
+            Request::ConversationOpenOperations {
+                agent_id,
+                conversation_id,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::Operations {
+                    operations: conversation.open_operations().await?,
+                })
+            }
             Request::ConversationFork {
                 agent_id,
                 conversation_id,
