@@ -2720,12 +2720,21 @@ impl ConversationHandle for BasicConversationHandle {
             self.harness
                 .inner
                 .storage
-                .put_json(
+                .put_json_fsync(
                     conversation_dir
                         .join("events")
                         .join(format!("{}.json", event.id)),
                     &event,
                 )
+                .await?;
+        }
+        // The copies are journal writes like any other: acknowledged means
+        // fsynced, one directory sync for the whole prefix.
+        if latest_event_id.is_some() {
+            self.harness
+                .inner
+                .storage
+                .sync_dir(conversation_dir.join("events"))
                 .await?;
         }
 
