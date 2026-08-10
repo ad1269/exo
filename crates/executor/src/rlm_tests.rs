@@ -91,6 +91,7 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("say done after you inspect context")],
             session_id: None,
         })
@@ -238,6 +239,7 @@ async fn rlm_subquery_variable_can_store_final_answer() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("what is 2 + 2?")],
             session_id: None,
         })
@@ -309,6 +311,7 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
 
     let mut stream = conversation
         .send_stream(SendRequest {
+            epoch: None,
             input: vec![user_message("what is 1 + 1?")],
             session_id: None,
         })
@@ -426,6 +429,7 @@ globalThis.answer = String(\n\
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("fn trace_test() { assert!(true); }")],
             session_id: None,
         })
@@ -434,6 +438,7 @@ globalThis.answer = String(\n\
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("how many assert statements are in that file?")],
             session_id: None,
         })
@@ -503,6 +508,7 @@ async fn rlm_can_finish_by_setting_final_in_repl() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("say done")],
             session_id: None,
         })

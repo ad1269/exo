@@ -233,6 +233,9 @@ pub struct ToolDefinition {
 pub struct SendRequest {
     pub input: Vec<Message>,
     pub session_id: Option<SessionId>,
+    /// Lease epoch the send runs under; stamped into the turn so every
+    /// commit is fenced. None when the caller holds no lease.
+    pub epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

@@ -17,14 +17,15 @@ use crate::protocol::{
     ClientMessage, ConversationHandleInfo, Request, Response, SandboxScope, ServerMessage,
 };
 use crate::{
-    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, AttachSandboxRequest, BeginOperationRequest, BeginOperationResult,
-    BeginTurnRequest, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, CompleteOperationRequest, ConversationHandle, ConversationId,
-    ConversationRecord, CreateSandboxRequest, Event, EventData, EventId, EventQuery, EventStream,
-    ExoHarness, ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
-    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
-    OperationRecord, PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest,
+    AcquireLeaseRequest, AcquireLeaseResult, AddEventsRequest, AddEventsResult, AgentHandle,
+    AgentId, AgentRecord, Artifact, ArtifactVersion, AttachSandboxRequest, BeginOperationRequest,
+    BeginOperationResult, BeginTurnRequest, Binding, BindingId, BindingRecord,
+    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, CompleteOperationRequest,
+    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
+    EventId, EventQuery, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
+    GetSandboxProcessEventsResult, LeaseState, ListConversationsRequest, ListConversationsResult,
+    NewAgentRequest, NewConversationRequest, OperationRecord, PutSecretRequest,
+    ReadArtifactRequest, ReleaseLeaseRequest, RenewLeaseRequest, Result, RunInSandboxRequest,
     SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
     SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
     SecretMetadata, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
@@ -920,6 +921,65 @@ impl ConversationHandle for HttpConversationHandle {
         {
             Response::Operations { operations } => Ok(operations),
             response => unexpected_response(response, "operations"),
+        }
+    }
+
+    async fn acquire_lease(&self, request: AcquireLeaseRequest) -> Result<AcquireLeaseResult> {
+        match self
+            .harness
+            .request(Request::ConversationAcquireLease {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::AcquireLease { result } => Ok(result),
+            response => unexpected_response(response, "acquire_lease"),
+        }
+    }
+
+    async fn renew_lease(&self, request: RenewLeaseRequest) -> Result<LeaseState> {
+        match self
+            .harness
+            .request(Request::ConversationRenewLease {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::Lease { lease } => Ok(lease),
+            response => unexpected_response(response, "lease"),
+        }
+    }
+
+    async fn release_lease(&self, request: ReleaseLeaseRequest) -> Result<LeaseState> {
+        match self
+            .harness
+            .request(Request::ConversationReleaseLease {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::Lease { lease } => Ok(lease),
+            response => unexpected_response(response, "lease"),
+        }
+    }
+
+    async fn current_lease(&self) -> Result<Option<LeaseState>> {
+        match self
+            .harness
+            .request(Request::ConversationCurrentLease {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+            })
+            .await?
+        {
+            Response::CurrentLease { lease } => Ok(lease),
+            response => unexpected_response(response, "current_lease"),
         }
     }
 

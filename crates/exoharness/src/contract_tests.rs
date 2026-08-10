@@ -9,12 +9,12 @@ use tokio::time::timeout;
 use tracing::info;
 
 use crate::{
-    AddEventsRequest, BeginOperationRequest, BeginTurnRequest, Binding, CompleteOperationRequest,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, ForkConversationRequest,
-    ListConversationsRequest, ListThreadsRequest, ManagedSandboxBackend, ManagedSandboxHandle,
-    NewAgentRequest, NewConversationRequest, NewThreadRequest, OperationOutcome, OperationState,
-    RecoveryBudget, RecoveryPolicy, SandboxCommand, SandboxRequest, ThreadHandle, Uuid7,
-    WriteArtifactRequest,
+    AcquireLeaseRequest, AddEventsRequest, BeginOperationRequest, BeginTurnRequest, Binding,
+    CompleteOperationRequest, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    ForkConversationRequest, ListConversationsRequest, ListThreadsRequest, ManagedSandboxBackend,
+    ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, NewThreadRequest,
+    OperationOutcome, OperationState, RecoveryBudget, RecoveryPolicy, ReleaseLeaseRequest,
+    RenewLeaseRequest, SandboxCommand, SandboxRequest, ThreadHandle, Uuid7, WriteArtifactRequest,
 };
 
 pub async fn supports_thread_api_and_conversation_compatibility(harness: Arc<dyn ExoHarness>) {
@@ -284,6 +284,7 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            epoch: None,
         })
         .await
         .expect("turn");
@@ -317,7 +318,7 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.data, EventData::TurnStarted))
+            .any(|event| matches!(event.data, EventData::TurnStarted { .. }))
     );
     assert!(
         events
@@ -351,6 +352,7 @@ pub async fn turn_events_continue_after_artifact_writes(harness: Arc<dyn ExoHarn
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            epoch: None,
         })
         .await
         .expect("turn");
@@ -406,6 +408,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
             max_attempts: Some(3),
             ..Default::default()
         },
+        epoch: None,
     };
 
     // T0: a crash before intent leaves no record — replay re-decides.
@@ -443,6 +446,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     // on the reconcile list; re-reporting it is idempotent.
     let uncertain = conversation
         .complete_operation(CompleteOperationRequest {
+            epoch: None,
             operation_id: begun.operation.operation_id,
             outcome: OperationOutcome::Uncertain,
             detail: Some("timed out mid-send".to_string()),
@@ -460,6 +464,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     );
     let replayed_uncertain = conversation
         .complete_operation(CompleteOperationRequest {
+            epoch: None,
             operation_id: begun.operation.operation_id,
             outcome: OperationOutcome::Uncertain,
             detail: Some("timed out mid-send".to_string()),
@@ -471,6 +476,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     // Reconciliation finds the effect landed: settle as succeeded.
     let settled = conversation
         .complete_operation(CompleteOperationRequest {
+            epoch: None,
             operation_id: begun.operation.operation_id,
             outcome: OperationOutcome::Succeeded,
             detail: None,
@@ -498,6 +504,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     // settled outcome; a conflicting outcome is refused.
     let acknowledged = conversation
         .complete_operation(CompleteOperationRequest {
+            epoch: None,
             operation_id: begun.operation.operation_id,
             outcome: OperationOutcome::Succeeded,
             detail: None,
@@ -507,6 +514,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     assert_eq!(acknowledged.state, OperationState::Succeeded);
     let absorbed = conversation
         .complete_operation(CompleteOperationRequest {
+            epoch: None,
             operation_id: begun.operation.operation_id,
             outcome: OperationOutcome::Uncertain,
             detail: None,
@@ -517,6 +525,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     assert!(
         conversation
             .complete_operation(CompleteOperationRequest {
+                epoch: None,
                 operation_id: begun.operation.operation_id,
                 outcome: OperationOutcome::Failed,
                 detail: None,
@@ -529,6 +538,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     assert!(
         conversation
             .complete_operation(CompleteOperationRequest {
+                epoch: None,
                 operation_id: Uuid7::now(),
                 outcome: OperationOutcome::Succeeded,
                 detail: None,
@@ -541,6 +551,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
     assert!(
         conversation
             .begin_operation(BeginOperationRequest {
+                epoch: None,
                 effect_kind: "adapter.react".to_string(),
                 idempotency_key: "send-1".to_string(),
                 recovery_policy: RecoveryPolicy::Retry,
@@ -558,6 +569,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
         .expect("second intent");
     conversation
         .complete_operation(CompleteOperationRequest {
+            epoch: None,
             operation_id: failed.operation.operation_id,
             outcome: OperationOutcome::Failed,
             detail: Some("destination rejected the payload".to_string()),
@@ -592,6 +604,7 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
                 session_id: None,
                 turn_id: None,
                 data: vec![EventData::OperationCompleted {
+                    epoch: None,
                     operation_id: begun.operation.operation_id,
                     outcome: OperationOutcome::Failed,
                     detail: None,
@@ -620,6 +633,357 @@ pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness
         .expect("completion events")
         .events;
     assert_eq!(completions.len(), 3);
+}
+
+pub async fn turn_leases_enforce_single_writer_with_epoch_fencing(harness: Arc<dyn ExoHarness>) {
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: unique_slug("agent"),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let fenced_send = |key: &str, epoch: Option<u64>| BeginOperationRequest {
+        effect_kind: "adapter.send".to_string(),
+        idempotency_key: key.to_string(),
+        recovery_policy: RecoveryPolicy::Reconcile,
+        budget: RecoveryBudget::default(),
+        epoch,
+    };
+
+    // CAS: a fresh thread grants at epoch 1; the same activation re-acquires
+    // its own lease idempotently; a competitor is refused and told who holds.
+    let first = conversation
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-a".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("first acquire");
+    assert!(first.acquired);
+    assert_eq!(first.lease.epoch, 1);
+    let again = conversation
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-a".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("idempotent acquire");
+    assert!(again.acquired);
+    assert_eq!(again.lease.lease_id, first.lease.lease_id);
+    assert_eq!(again.lease.epoch, 1);
+    let competitor = conversation
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-b".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("competing acquire");
+    assert!(!competitor.acquired);
+    assert_eq!(competitor.lease.holder, "activation-a");
+    assert!(
+        conversation
+            .current_lease()
+            .await
+            .expect("current lease")
+            .is_some()
+    );
+
+    // Renewal extends the holder's lease; a stale epoch is refused loudly.
+    let renewed = conversation
+        .renew_lease(RenewLeaseRequest {
+            lease_id: first.lease.lease_id,
+            epoch: 1,
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("renew");
+    assert!(renewed.expires_at >= first.lease.expires_at);
+    assert!(
+        conversation
+            .renew_lease(RenewLeaseRequest {
+                lease_id: first.lease.lease_id,
+                epoch: 2,
+                ttl_ms: 60_000,
+            })
+            .await
+            .is_err()
+    );
+
+    // Effect fencing: while the lease is live, initiating without its epoch
+    // — or with a stale one — is refused; the current epoch passes.
+    assert!(
+        conversation
+            .begin_operation(fenced_send("op-1", None))
+            .await
+            .is_err()
+    );
+    assert!(
+        conversation
+            .begin_operation(fenced_send("op-1", Some(2)))
+            .await
+            .is_err()
+    );
+    let fenced = conversation
+        .begin_operation(fenced_send("op-1", Some(1)))
+        .await
+        .expect("fenced begin");
+    assert!(fenced.created);
+
+    // Completion is observation: recorded with provenance, never fenced.
+    let completed = conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: fenced.operation.operation_id,
+            outcome: OperationOutcome::Succeeded,
+            detail: None,
+            epoch: Some(1),
+        })
+        .await
+        .expect("fenced completion");
+    assert_eq!(completed.completion_epoch, Some(1));
+
+    // Turn fencing: begin_turn obeys the same rule, and the granted epoch
+    // rides the turn into every commit.
+    assert!(
+        conversation
+            .begin_turn(BeginTurnRequest {
+                session_id: None,
+                input: vec![user_message("fenced?")],
+                epoch: None,
+            })
+            .await
+            .is_err()
+    );
+    let fenced_turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("fenced")],
+            epoch: Some(1),
+        })
+        .await
+        .expect("fenced turn");
+    fenced_turn
+        .add_events(vec![EventData::Messages {
+            messages: vec![assistant_message("ack")],
+            response_id: None,
+            usage: None,
+        }])
+        .await
+        .expect("fenced turn commit");
+    fenced_turn.finish().await.expect("fenced turn finish");
+
+    // Release: wrong epoch refused; the holder's release makes the thread
+    // claimable; replaying the release is idempotent.
+    assert!(
+        conversation
+            .release_lease(ReleaseLeaseRequest {
+                lease_id: first.lease.lease_id,
+                epoch: 2,
+            })
+            .await
+            .is_err()
+    );
+    let released = conversation
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: first.lease.lease_id,
+            epoch: 1,
+        })
+        .await
+        .expect("release");
+    assert!(released.released);
+    let replayed = conversation
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: first.lease.lease_id,
+            epoch: 1,
+        })
+        .await
+        .expect("release replay");
+    assert!(replayed.released);
+    assert!(
+        conversation
+            .current_lease()
+            .await
+            .expect("current lease")
+            .is_none()
+    );
+
+    // With no live lease, unfenced writes work again — M2 standalone — and
+    // the next acquisition mints the next epoch, never reusing one.
+    let unfenced = conversation
+        .begin_operation(fenced_send("op-2", None))
+        .await
+        .expect("unfenced begin after release");
+    assert!(unfenced.created);
+    let second = conversation
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-b".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("second acquire");
+    assert!(second.acquired);
+    assert_eq!(second.lease.epoch, 2);
+
+    // A zombie turn: begun under epoch 2, superseded by epoch 3 — its next
+    // commit fails structurally, but completions it already owed stay
+    // recordable (observation asymmetry).
+    let zombie_turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("zombie")],
+            epoch: Some(2),
+        })
+        .await
+        .expect("turn under epoch 2");
+    let zombie_operation = conversation
+        .begin_operation(fenced_send("op-3", Some(2)))
+        .await
+        .expect("operation under epoch 2");
+    conversation
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: second.lease.lease_id,
+            epoch: 2,
+        })
+        .await
+        .expect("release epoch 2");
+    let third = conversation
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-c".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("third acquire");
+    assert_eq!(third.lease.epoch, 3);
+    assert!(
+        zombie_turn
+            .add_events(vec![EventData::Messages {
+                messages: vec![assistant_message("too late")],
+                response_id: None,
+                usage: None,
+            }])
+            .await
+            .is_err()
+    );
+    let honest_report = conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: zombie_operation.operation.operation_id,
+            outcome: OperationOutcome::Uncertain,
+            detail: Some("superseded mid-send".to_string()),
+            epoch: Some(2),
+        })
+        .await
+        .expect("superseded activation's completion is still recorded");
+    assert_eq!(honest_report.completion_epoch, Some(2));
+
+    // The pre-lease turn: begun with None while the thread was unleased —
+    // here, under epoch 3's live lease, that shape is already unbeginnable;
+    // the decided behavior for one that exists is preemption at the commit
+    // boundary, covered below on a fresh thread.
+    let preempt = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("preemption conversation");
+    let open_turn = preempt
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("unfenced")],
+            epoch: None,
+        })
+        .await
+        .expect("pre-lease turn");
+    open_turn
+        .add_events(vec![EventData::Messages {
+            messages: vec![assistant_message("still unleased")],
+            response_id: None,
+            usage: None,
+        }])
+        .await
+        .expect("pre-lease commit");
+    let preemptor = preempt
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-p".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("preempting acquire");
+    assert!(preemptor.acquired);
+    assert!(
+        open_turn
+            .add_events(vec![EventData::Messages {
+                messages: vec![assistant_message("preempted")],
+                response_id: None,
+                usage: None,
+            }])
+            .await
+            .is_err(),
+        "a new lease preempts the pre-lease turn at its next commit"
+    );
+
+    // Expiry: a lease that is not renewed lapses and the thread is
+    // claimable — the takeover mints the next epoch.
+    preempt
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: preemptor.lease.lease_id,
+            epoch: preemptor.lease.epoch,
+        })
+        .await
+        .expect("release preemptor");
+    let brief = preempt
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-q".to_string(),
+            ttl_ms: 80,
+        })
+        .await
+        .expect("brief acquire");
+    assert!(brief.acquired);
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    assert!(
+        preempt
+            .current_lease()
+            .await
+            .expect("current lease")
+            .is_none(),
+        "an expired lease is not live"
+    );
+    assert!(
+        preempt
+            .renew_lease(RenewLeaseRequest {
+                lease_id: brief.lease.lease_id,
+                epoch: brief.lease.epoch,
+                ttl_ms: 60_000,
+            })
+            .await
+            .is_err(),
+        "an expired lease cannot be renewed back to life"
+    );
+    let takeover = preempt
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-r".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("takeover acquire");
+    assert!(takeover.acquired);
+    assert_eq!(takeover.lease.epoch, brief.lease.epoch + 1);
+
+    // Lease events are kernel-minted only.
+    assert!(
+        preempt
+            .add_events(AddEventsRequest {
+                session_id: None,
+                turn_id: None,
+                data: vec![EventData::LeaseReleased {
+                    lease_id: takeover.lease.lease_id,
+                    epoch: takeover.lease.epoch,
+                }],
+            })
+            .await
+            .is_err()
+    );
 }
 
 pub async fn conversation_scope_overrides_agent_scope_and_fork_copies_bindings(

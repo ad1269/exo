@@ -100,6 +100,104 @@ async fn creates_agents_and_conversations_with_persisted_config() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn wakeups_run_under_a_kernel_lease_and_release_it() {
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+    let pong = |text: &str| ModelResponse {
+        provider_cost_usd: None,
+        response_id: Some(Uuid7::now()),
+        messages: vec![assistant_message(text)],
+        tool_calls: Vec::new(),
+        usage: None,
+        model: None,
+        ttft: None,
+        duration: None,
+    };
+    let harness = BasicHarness::new(
+        exoharness,
+        Arc::new(FakeModelClient::new(vec![pong("pong"), pong("pong 2")])),
+        Arc::new(BasicToolRuntime),
+    );
+    register_test_models(harness.exoharness_handle().as_ref()).await;
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "demo".to_string(),
+            name: None,
+            harness: crate::AgentHarnessKind::Basic,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            sandbox_scope: None,
+            enable_networking: false,
+            model: "gpt-5.4".to_string(),
+            max_output_tokens: None,
+            max_tool_round_trips: Some(2),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    crate::send_conversation_wakeup(conversation.as_ref(), "ping".to_string())
+        .await
+        .expect("wakeup should succeed");
+
+    let handle = conversation.exoharness_handle();
+    assert!(
+        handle
+            .current_lease()
+            .await
+            .expect("current lease")
+            .is_none(),
+        "the wakeup releases its lease"
+    );
+    let events = handle
+        .get_events(None)
+        .await
+        .expect("events should load")
+        .events;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.data, EventData::LeaseAcquired { epoch: 1, .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.data, EventData::LeaseReleased { epoch: 1, .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.data, EventData::TurnStarted { epoch: Some(1) }),),
+        "the wakeup's turn carries the lease epoch"
+    );
+
+    // The next wakeup is a new activation: next epoch, same clean release.
+    crate::send_conversation_wakeup(conversation.as_ref(), "ping 2".to_string())
+        .await
+        .expect("second wakeup should succeed");
+    let events = handle
+        .get_events(None)
+        .await
+        .expect("events should load")
+        .events;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.data, EventData::LeaseAcquired { epoch: 2, .. }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn send_persists_messages_through_harness() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
@@ -148,6 +246,7 @@ async fn send_persists_messages_through_harness() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("ping")],
             session_id: None,
         })
@@ -269,6 +368,7 @@ async fn usage_record_is_persisted_with_computed_cost() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("ping")],
             session_id: None,
         })
@@ -416,6 +516,7 @@ async fn usage_record_with_anthropic_cache_hits() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("ping")],
             session_id: None,
         })
@@ -538,6 +639,7 @@ async fn usage_record_with_openai_inclusive_accounting() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("ping")],
             session_id: None,
         })
@@ -620,6 +722,7 @@ async fn close_session_appends_session_ended_event() {
 
     let result = conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("ping")],
             session_id: None,
         })
@@ -710,6 +813,7 @@ async fn updating_agent_config_refreshes_executor_cache() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("first")],
             session_id: None,
         })
@@ -725,6 +829,7 @@ async fn updating_agent_config_refreshes_executor_cache() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("second")],
             session_id: None,
         })
@@ -814,6 +919,7 @@ async fn send_executes_shell_tool_when_enabled() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("run shell")],
             session_id: None,
         })
@@ -1032,6 +1138,7 @@ async fn updating_mounts_recreates_conversation_sandbox() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("first")],
             session_id: None,
         })
@@ -1074,6 +1181,7 @@ async fn updating_mounts_recreates_conversation_sandbox() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("second")],
             session_id: None,
         })
@@ -1312,6 +1420,7 @@ async fn conversation_model_override_changes_effective_model() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("first")],
             session_id: None,
         })
@@ -1339,6 +1448,7 @@ async fn conversation_model_override_changes_effective_model() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("second")],
             session_id: None,
         })
@@ -1352,6 +1462,7 @@ async fn conversation_model_override_changes_effective_model() {
 
     conversation
         .send(SendRequest {
+            epoch: None,
             input: vec![user_message("third")],
             session_id: None,
         })

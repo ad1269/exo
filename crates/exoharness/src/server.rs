@@ -317,6 +317,45 @@ impl ExoHarnessServer {
                     operations: conversation.open_operations().await?,
                 })
             }
+            Request::ConversationAcquireLease {
+                agent_id,
+                conversation_id,
+                request,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::AcquireLease {
+                    result: conversation.acquire_lease(request).await?,
+                })
+            }
+            Request::ConversationRenewLease {
+                agent_id,
+                conversation_id,
+                request,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::Lease {
+                    lease: conversation.renew_lease(request).await?,
+                })
+            }
+            Request::ConversationReleaseLease {
+                agent_id,
+                conversation_id,
+                request,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::Lease {
+                    lease: conversation.release_lease(request).await?,
+                })
+            }
+            Request::ConversationCurrentLease {
+                agent_id,
+                conversation_id,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::CurrentLease {
+                    lease: conversation.current_lease().await?,
+                })
+            }
             Request::ConversationFork {
                 agent_id,
                 conversation_id,
@@ -859,6 +898,9 @@ impl ExoHarnessServer {
             .turn_handle(TurnRecord {
                 id: turn_id,
                 session_id,
+                // Recovered from the journal by turn_handle; the wire does
+                // not carry an epoch.
+                epoch: None,
             })
             .await
     }

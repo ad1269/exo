@@ -157,6 +157,23 @@ pub trait ThreadHandle: SandboxHandle {
     /// works through.
     async fn open_operations(&self) -> Result<Vec<OperationRecord>>;
 
+    /// Compare-and-swap under the journal lock: grants when no lease is live
+    /// (never held, expired, or released), minting the next epoch; returns
+    /// the live lease unacquired when another holder has it; idempotently
+    /// returns the caller's own live lease.
+    async fn acquire_lease(&self, request: AcquireLeaseRequest) -> Result<AcquireLeaseResult>;
+    /// Extends a live lease the caller still holds. A stale-epoch error here
+    /// is how a superseded activation learns it is fenced: stop initiating
+    /// effects, record in-flight completions, exit.
+    async fn renew_lease(&self, request: RenewLeaseRequest) -> Result<LeaseState>;
+    /// Ends the caller's live lease, making the thread claimable without
+    /// waiting out the TTL. Replay on the already-released lease is
+    /// idempotent.
+    async fn release_lease(&self, request: ReleaseLeaseRequest) -> Result<LeaseState>;
+    /// The live lease, if any. Liveness is judged against the kernel clock
+    /// at read time — expiry is not an event.
+    async fn current_lease(&self) -> Result<Option<LeaseState>>;
+
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>>;
@@ -256,12 +273,21 @@ pub type ListConversationsRequest = ListThreadsRequest;
 pub struct TurnRecord {
     pub id: TurnId,
     pub session_id: SessionId,
+    /// The lease epoch this turn was begun under. Every commit through the
+    /// turn re-checks it against the live lease, so a superseded turn's
+    /// writes fail structurally rather than by the holder's good behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BeginTurnRequest {
     pub session_id: Option<SessionId>,
     pub input: Vec<Message>,
+    /// Fencing token, same rule as `BeginOperationRequest::epoch`: required
+    /// and current while a lease is live, None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +345,9 @@ impl EventKind {
     pub const SANDBOX_PROCESS_EVENT: EventKind = EventKind(Cow::Borrowed("sandbox_process_event"));
     pub const OPERATION_INTENT: EventKind = EventKind(Cow::Borrowed("operation_intent"));
     pub const OPERATION_COMPLETED: EventKind = EventKind(Cow::Borrowed("operation_completed"));
+    pub const LEASE_ACQUIRED: EventKind = EventKind(Cow::Borrowed("lease_acquired"));
+    pub const LEASE_RENEWED: EventKind = EventKind(Cow::Borrowed("lease_renewed"));
+    pub const LEASE_RELEASED: EventKind = EventKind(Cow::Borrowed("lease_released"));
 
     pub fn custom(name: impl Into<Cow<'static, str>>) -> Self {
         Self(name.into())
@@ -444,7 +473,13 @@ pub enum EventData {
     },
     SessionStarted,
     SessionEnded,
-    TurnStarted,
+    TurnStarted {
+        /// The lease epoch the turn was begun under, journaled so a rebuilt
+        /// turn handle recovers its fencing token from the log rather than
+        /// trusting the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+    },
     TurnEnded,
     Messages {
         messages: Vec<Message>,
@@ -549,6 +584,26 @@ pub enum EventData {
         outcome: OperationOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Reporting activation's epoch. Provenance, never authorization: a
+        /// stale activation's honest report is recorded and stays
+        /// distinguishable at audit time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+    },
+    LeaseAcquired {
+        lease_id: LeaseId,
+        holder: String,
+        epoch: u64,
+        ttl_ms: u64,
+    },
+    LeaseRenewed {
+        lease_id: LeaseId,
+        epoch: u64,
+        ttl_ms: u64,
+    },
+    LeaseReleased {
+        lease_id: LeaseId,
+        epoch: u64,
     },
     Custom {
         event_type: String,
@@ -567,7 +622,7 @@ impl EventData {
             Self::ThreadForked { .. } => EventKind::THREAD_FORKED,
             Self::SessionStarted => EventKind::SESSION_STARTED,
             Self::SessionEnded => EventKind::SESSION_ENDED,
-            Self::TurnStarted => EventKind::TURN_STARTED,
+            Self::TurnStarted { .. } => EventKind::TURN_STARTED,
             Self::TurnEnded => EventKind::TURN_ENDED,
             Self::Messages { .. } => EventKind::MESSAGES,
             Self::ToolRequested { .. } => EventKind::TOOL_REQUESTED,
@@ -586,6 +641,9 @@ impl EventData {
             Self::SandboxProcessEvent { .. } => EventKind::SANDBOX_PROCESS_EVENT,
             Self::OperationIntent { .. } => EventKind::OPERATION_INTENT,
             Self::OperationCompleted { .. } => EventKind::OPERATION_COMPLETED,
+            Self::LeaseAcquired { .. } => EventKind::LEASE_ACQUIRED,
+            Self::LeaseRenewed { .. } => EventKind::LEASE_RENEWED,
+            Self::LeaseReleased { .. } => EventKind::LEASE_RELEASED,
             Self::Custom { event_type, .. } => EventKind::custom(event_type.clone()),
         }
     }
@@ -669,6 +727,11 @@ pub struct BeginOperationRequest {
     pub recovery_policy: RecoveryPolicy,
     #[serde(default)]
     pub budget: RecoveryBudget,
+    /// Fencing token. While a lease is live this must be its current epoch —
+    /// initiating an effect is exactly what a superseded activation must not
+    /// do. With no live lease, None passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -677,6 +740,11 @@ pub struct CompleteOperationRequest {
     pub outcome: OperationOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Recorded in the completion event as provenance; never checked.
+    /// Completion is observation, and refusing a superseded activation's
+    /// honest report would lose what actually happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -694,6 +762,8 @@ pub struct OperationRecord {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_event_id: Option<EventId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -702,6 +772,109 @@ pub struct BeginOperationResult {
     /// False when an existing record under the same idempotency key was
     /// returned instead of a new intent being written.
     pub created: bool,
+}
+
+pub type LeaseId = Uuid7;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AcquireLeaseRequest {
+    /// Activation id — one per process incarnation, not per logical
+    /// executor. A restarted process is a new activation with a new holder.
+    pub holder: String,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenewLeaseRequest {
+    pub lease_id: LeaseId,
+    pub epoch: u64,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseLeaseRequest {
+    pub lease_id: LeaseId,
+    pub epoch: u64,
+}
+
+/// The latest lease on a thread — live or not; liveness is a judgment made
+/// against a clock, not a stored fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LeaseState {
+    pub lease_id: LeaseId,
+    pub holder: String,
+    /// Monotonic per thread across every acquisition; minted only by
+    /// acquire, never reused. The fencing token.
+    pub epoch: u64,
+    pub ttl_ms: u64,
+    pub expires_at: DateTimeUtc,
+    pub released: bool,
+}
+
+impl LeaseState {
+    pub fn is_live_at(&self, now: DateTimeUtc) -> bool {
+        !self.released && now < self.expires_at
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AcquireLeaseResult {
+    pub lease: LeaseState,
+    /// True when the caller holds the lease after this call — a fresh grant
+    /// or its own live lease returned idempotently. False means another
+    /// holder is live; back off.
+    pub acquired: bool,
+}
+
+/// Replays lease events to the latest lease, in event order. Expiry is not
+/// an event: an expired lease is simply not live at read time, which is what
+/// makes the stream claimable again without kernel timers.
+pub fn fold_lease(events: &[Event]) -> Option<LeaseState> {
+    let mut lease: Option<LeaseState> = None;
+    for event in events {
+        match &event.data {
+            EventData::LeaseAcquired {
+                lease_id,
+                holder,
+                epoch,
+                ttl_ms,
+            } => {
+                lease = Some(LeaseState {
+                    lease_id: *lease_id,
+                    holder: holder.clone(),
+                    epoch: *epoch,
+                    ttl_ms: *ttl_ms,
+                    expires_at: event.created_at + chrono::Duration::milliseconds(*ttl_ms as i64),
+                    released: false,
+                });
+            }
+            EventData::LeaseRenewed {
+                lease_id,
+                epoch,
+                ttl_ms,
+            } => {
+                if let Some(current) = lease.as_mut()
+                    && current.lease_id == *lease_id
+                    && current.epoch == *epoch
+                    && !current.released
+                {
+                    current.ttl_ms = *ttl_ms;
+                    current.expires_at =
+                        event.created_at + chrono::Duration::milliseconds(*ttl_ms as i64);
+                }
+            }
+            EventData::LeaseReleased { lease_id, epoch } => {
+                if let Some(current) = lease.as_mut()
+                    && current.lease_id == *lease_id
+                    && current.epoch == *epoch
+                {
+                    current.released = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    lease
 }
 
 /// Replays operation events into current records, in event order. Total over
@@ -730,11 +903,13 @@ pub fn fold_operations(events: &[Event]) -> Vec<OperationRecord> {
                 state: OperationState::Open,
                 detail: None,
                 completion_event_id: None,
+                completion_epoch: None,
             }),
             EventData::OperationCompleted {
                 operation_id,
                 outcome,
                 detail,
+                epoch,
             } => {
                 let Some(operation) = operations
                     .iter_mut()
@@ -748,6 +923,7 @@ pub fn fold_operations(events: &[Event]) -> Vec<OperationRecord> {
                 operation.state = (*outcome).into();
                 operation.detail = detail.clone();
                 operation.completion_event_id = Some(event.id);
+                operation.completion_epoch = *epoch;
             }
             _ => {}
         }

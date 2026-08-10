@@ -766,6 +766,31 @@ impl ConversationHandle for LocalSandboxConversation {
         self.remote.open_operations().await
     }
 
+    async fn acquire_lease(
+        &self,
+        request: exoharness::AcquireLeaseRequest,
+    ) -> Result<exoharness::AcquireLeaseResult> {
+        self.remote.acquire_lease(request).await
+    }
+
+    async fn renew_lease(
+        &self,
+        request: exoharness::RenewLeaseRequest,
+    ) -> Result<exoharness::LeaseState> {
+        self.remote.renew_lease(request).await
+    }
+
+    async fn release_lease(
+        &self,
+        request: exoharness::ReleaseLeaseRequest,
+    ) -> Result<exoharness::LeaseState> {
+        self.remote.release_lease(request).await
+    }
+
+    async fn current_lease(&self) -> Result<Option<exoharness::LeaseState>> {
+        self.remote.current_lease().await
+    }
+
     async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
         let remote = self.remote.fork(request).await?;
         Ok(wrap_conversation(Arc::clone(&self.state), remote))

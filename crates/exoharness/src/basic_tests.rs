@@ -19,17 +19,17 @@ use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
-    Artifact, ArtifactVersion, BasicExoHarness, BeginOperationRequest, BeginTurnRequest, Binding,
-    BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest, CompleteOperationRequest,
-    CreateSandboxRequest, DurableFileSystem, EventData, EventKind, EventQuery, EventQueryDirection,
-    ExoHarness, FileSystemMountMode, ForkConversationRequest, ManagedSandboxBackend,
-    ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, OperationOutcome,
-    OperationState, PutSecretRequest, RecoveryBudget, RecoveryPolicy, RunInSandboxRequest,
-    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
-    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
-    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind,
-    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
+    AcquireLeaseRequest, Artifact, ArtifactVersion, BasicExoHarness, BeginOperationRequest,
+    BeginTurnRequest, Binding, BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest,
+    CompleteOperationRequest, CreateSandboxRequest, DurableFileSystem, EventData, EventKind,
+    EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode, ForkConversationRequest,
+    ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
+    OperationOutcome, OperationState, PutSecretRequest, RecoveryBudget, RecoveryPolicy,
+    RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration, SandboxCommand,
+    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
+    Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
@@ -190,6 +190,7 @@ async fn basic_backend_operation_records_survive_restart() {
     assert_eq!(resumed.operation.operation_id, begun.operation.operation_id);
     conversation
         .complete_operation(CompleteOperationRequest {
+            epoch: None,
             operation_id: begun.operation.operation_id,
             outcome: OperationOutcome::Succeeded,
             detail: None,
@@ -232,7 +233,88 @@ fn begin_send_request(key: &str) -> BeginOperationRequest {
         idempotency_key: key.to_string(),
         recovery_policy: RecoveryPolicy::Reconcile,
         budget: RecoveryBudget::default(),
+        epoch: None,
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_turn_leases_enforce_single_writer_with_epoch_fencing() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path()))
+            .await
+            .expect("harness should initialize"),
+    );
+    crate::contract_tests::turn_leases_enforce_single_writer_with_epoch_fencing(harness).await;
+}
+
+// The restart half: the lease, its epoch, and the fence all survive into a
+// new process over the same root.
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_leases_survive_restart() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let agent_id = agent.record().id;
+    let conversation_id = conversation.record().id;
+    let granted = conversation
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-a".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("acquire");
+    assert!(granted.acquired);
+    drop(conversation);
+    drop(agent);
+    drop(harness);
+
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should reopen");
+    let conversation = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup")
+        .expect("agent survives restart")
+        .get_conversation(&conversation_id)
+        .await
+        .expect("conversation lookup")
+        .expect("conversation survives restart");
+    let live = conversation
+        .current_lease()
+        .await
+        .expect("current lease")
+        .expect("lease survives restart");
+    assert_eq!(live.lease_id, granted.lease.lease_id);
+    assert_eq!(live.epoch, 1);
+    // The fence survives with it: unfenced initiation is still refused.
+    assert!(
+        conversation
+            .begin_operation(begin_send_request("fenced-after-restart"))
+            .await
+            .is_err()
+    );
+    let fenced = conversation
+        .begin_operation(BeginOperationRequest {
+            epoch: Some(1),
+            ..begin_send_request("fenced-after-restart")
+        })
+        .await
+        .expect("fenced begin after restart");
+    assert!(fenced.created);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -637,6 +719,7 @@ async fn turn_events_continue_after_artifact_writes() {
 
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: vec![user_message("ping")],
         })
@@ -693,6 +776,7 @@ async fn turn_artifact_write_allows_interleaved_conversation_writes() {
         .expect("conversation");
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: vec![user_message("ping")],
         })
@@ -1226,6 +1310,7 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
         .expect("conversation");
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: vec![user_message("start turn")],
         })

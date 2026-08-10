@@ -115,6 +115,15 @@ async fn http_exoharness_operation_records_cover_the_crash_table() {
 }
 
 #[actix_web::test]
+async fn http_exoharness_turn_leases_enforce_single_writer_with_epoch_fencing() {
+    let fixture = http_harness().await;
+    crate::contract_tests::turn_leases_enforce_single_writer_with_epoch_fencing(Arc::clone(
+        &fixture.harness,
+    ))
+    .await;
+}
+
+#[actix_web::test]
 async fn http_exoharness_conversation_scope_overrides_and_forks() {
     let fixture = http_harness().await;
     crate::contract_tests::conversation_scope_overrides_agent_scope_and_fork_copies_bindings(
@@ -368,6 +377,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
         .expect("sandbox");
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: Vec::new(),
         })

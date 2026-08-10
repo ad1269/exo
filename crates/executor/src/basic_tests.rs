@@ -58,6 +58,7 @@ async fn send_appends_user_and_assistant_messages() {
     );
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: vec![user_message("ping")],
         })
@@ -106,7 +107,7 @@ async fn send_appends_user_and_assistant_messages() {
         events[0].session_id.expect("session id")
     );
     assert!(matches!(events[0].data, EventData::SessionStarted));
-    assert!(matches!(events[1].data, EventData::TurnStarted));
+    assert!(matches!(events[1].data, EventData::TurnStarted { .. }));
     assert!(matches!(events[2].data, EventData::Messages { .. }));
     assert!(matches!(events[3].data, EventData::Messages { .. }));
     assert!(matches!(events[4].data, EventData::TurnEnded));
@@ -172,6 +173,7 @@ async fn send_executes_tool_round_trip() {
     };
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: vec![user_message("run it")],
         })
@@ -288,6 +290,7 @@ async fn send_records_tool_result_when_tool_execution_fails() {
     );
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: vec![user_message("run it")],
         })
@@ -390,6 +393,7 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
     );
     let turn = conversation
         .begin_turn(BeginTurnRequest {
+            epoch: None,
             session_id: None,
             input: vec![user_message("stream it")],
         })
@@ -904,7 +908,7 @@ impl ConversationHandle for FakeConversationHandle {
             &self.state,
             session_id,
             Some(turn_id),
-            EventData::TurnStarted,
+            EventData::TurnStarted { epoch: None },
         ));
         if !request.input.is_empty() {
             latest_event_id = Some(append_event(
@@ -923,6 +927,7 @@ impl ConversationHandle for FakeConversationHandle {
             record: TurnRecord {
                 id: turn_id,
                 session_id,
+                epoch: None,
             },
             latest_event_id: Mutex::new(latest_event_id),
         }))
@@ -1046,6 +1051,31 @@ impl ConversationHandle for FakeConversationHandle {
 
     async fn open_operations(&self) -> Result<Vec<exoharness::OperationRecord>> {
         Ok(Vec::new())
+    }
+
+    async fn acquire_lease(
+        &self,
+        _request: exoharness::AcquireLeaseRequest,
+    ) -> Result<exoharness::AcquireLeaseResult> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn renew_lease(
+        &self,
+        _request: exoharness::RenewLeaseRequest,
+    ) -> Result<exoharness::LeaseState> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn release_lease(
+        &self,
+        _request: exoharness::ReleaseLeaseRequest,
+    ) -> Result<exoharness::LeaseState> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn current_lease(&self) -> Result<Option<exoharness::LeaseState>> {
+        Ok(None)
     }
 
     async fn fork(&self, _request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {

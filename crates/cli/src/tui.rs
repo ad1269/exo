@@ -566,6 +566,7 @@ impl ChatRepl {
         let mut stream = self
             .conversation
             .send_stream(SendRequest {
+                epoch: None,
                 input: vec![Message::User {
                     content: UserContent::String(input.to_string()),
                 }],

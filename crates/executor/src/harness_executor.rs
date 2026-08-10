@@ -173,6 +173,7 @@ where
             .begin_turn(BeginTurnRequest {
                 session_id: request.session_id,
                 input: request.input,
+                epoch: request.epoch,
             })
             .await?;
         let trace_agent_config = agent_config.clone();
@@ -232,6 +233,7 @@ where
             .begin_turn(BeginTurnRequest {
                 session_id: request.session_id,
                 input: request.input,
+                epoch: request.epoch,
             })
             .await?;
         let trace_agent_config = agent_config.clone();

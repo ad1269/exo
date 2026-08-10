@@ -32,23 +32,23 @@ use crate::secrets::{
 };
 use crate::storage::BasicObjectStore;
 use crate::{
-    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, AttachSandboxRequest, BeginOperationRequest, BeginOperationResult,
-    BeginTurnRequest, Binding, BindingId, BindingRecord, BindingType, BoxAsyncRead, BoxAsyncWrite,
-    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, CompleteOperationRequest,
-    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest,
-    DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
-    EventStream, ExoHarness, FileSystemMount, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, OperationOutcome, OperationRecord, OperationState,
-    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment,
-    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret,
-    SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
-    fold_operations,
+    AcquireLeaseRequest, AcquireLeaseResult, AddEventsRequest, AddEventsResult, AgentHandle,
+    AgentId, AgentRecord, Artifact, ArtifactVersion, AttachSandboxRequest, BeginOperationRequest,
+    BeginOperationResult, BeginTurnRequest, Binding, BindingId, BindingRecord, BindingType,
+    BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
+    CompleteOperationRequest, ConversationHandle, ConversationId, ConversationRecord,
+    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
+    GetEventsResult, GetSandboxProcessEventsResult, LeaseId, LeaseState, ListConversationsRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, OperationOutcome,
+    OperationRecord, OperationState, PutSecretRequest, ReadArtifactRequest, ReleaseLeaseRequest,
+    RenewLeaseRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
+    SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata,
+    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest, fold_lease, fold_operations,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -2224,6 +2224,13 @@ impl ConversationHandle for BasicConversationHandle {
 
     async fn begin_turn(&self, request: BeginTurnRequest) -> Result<Arc<dyn TurnHandle>> {
         let _guard = self.harness.inner.write_lock.lock().await;
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        ensure_current_epoch(
+            fold_lease(&events).as_ref(),
+            request.epoch,
+            Utc::now(),
+            "begin_turn",
+        )?;
         let mut record = self.load_record().await?;
         let conversation_dir = self.conversation_dir();
 
@@ -2231,13 +2238,16 @@ impl ConversationHandle for BasicConversationHandle {
         let turn_record = TurnRecord {
             id: Uuid7::now(),
             session_id,
+            epoch: request.epoch,
         };
         let mut events_to_append = Vec::new();
 
         if request.session_id.is_none() {
             events_to_append.push(EventData::SessionStarted);
         }
-        events_to_append.push(EventData::TurnStarted);
+        events_to_append.push(EventData::TurnStarted {
+            epoch: request.epoch,
+        });
         if !request.input.is_empty() {
             events_to_append.push(EventData::Messages {
                 messages: request.input,
@@ -2280,6 +2290,7 @@ impl ConversationHandle for BasicConversationHandle {
         let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
         let mut latest_event_id = None;
         let mut finished = false;
+        let mut epoch = None;
         for event in events
             .into_iter()
             .filter(|event| event.session_id == Some(record.session_id))
@@ -2287,6 +2298,12 @@ impl ConversationHandle for BasicConversationHandle {
         {
             latest_event_id = Some(event.id);
             finished = matches!(event.data, EventData::TurnEnded);
+            if let EventData::TurnStarted {
+                epoch: turn_epoch, ..
+            } = event.data
+            {
+                epoch = turn_epoch;
+            }
         }
         if latest_event_id.is_none() {
             bail!(
@@ -2299,7 +2316,9 @@ impl ConversationHandle for BasicConversationHandle {
             harness: self.harness.clone(),
             conversation_dir: self.conversation_dir(),
             conversation_id: self.record.id,
-            record,
+            // The journal is the authority on the turn's fencing token; the
+            // wire never carries one.
+            record: TurnRecord { epoch, ..record },
             state: Mutex::new(BasicTurnState {
                 latest_event_id,
                 finished,
@@ -2376,7 +2395,7 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult> {
-        ensure_no_operation_events(&request.data)?;
+        ensure_appendable_events(&request.data)?;
         self.append_events_internal(request.session_id, request.turn_id, None, request.data)
             .await
     }
@@ -2387,6 +2406,12 @@ impl ConversationHandle for BasicConversationHandle {
     ) -> Result<BeginOperationResult> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        ensure_current_epoch(
+            fold_lease(&events).as_ref(),
+            request.epoch,
+            Utc::now(),
+            "begin_operation",
+        )?;
         let operations = fold_operations(&events);
         let prior = operations
             .iter()
@@ -2413,7 +2438,7 @@ impl ConversationHandle for BasicConversationHandle {
         };
         let operation_id = Uuid7::now();
         let add_result = self
-            .append_operation_event_locked(EventData::OperationIntent {
+            .append_kernel_event_locked(EventData::OperationIntent {
                 operation_id,
                 effect_kind: request.effect_kind.clone(),
                 idempotency_key: request.idempotency_key.clone(),
@@ -2434,6 +2459,7 @@ impl ConversationHandle for BasicConversationHandle {
                 state: OperationState::Open,
                 detail: None,
                 completion_event_id: None,
+                completion_epoch: None,
             },
             created: true,
         })
@@ -2466,15 +2492,17 @@ impl ConversationHandle for BasicConversationHandle {
             );
         }
         let add_result = self
-            .append_operation_event_locked(EventData::OperationCompleted {
+            .append_kernel_event_locked(EventData::OperationCompleted {
                 operation_id: request.operation_id,
                 outcome: request.outcome,
                 detail: request.detail.clone(),
+                epoch: request.epoch,
             })
             .await?;
         operation.state = requested;
         operation.detail = request.detail;
         operation.completion_event_id = Some(add_result.latest_event_id);
+        operation.completion_epoch = request.epoch;
         Ok(operation)
     }
 
@@ -2484,6 +2512,106 @@ impl ConversationHandle for BasicConversationHandle {
             .into_iter()
             .filter(|operation| !operation.state.is_terminal())
             .collect())
+    }
+
+    async fn acquire_lease(&self, request: AcquireLeaseRequest) -> Result<AcquireLeaseResult> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let latest = fold_lease(&events);
+        let now = Utc::now();
+        if let Some(lease) = &latest
+            && lease.is_live_at(now)
+        {
+            return Ok(AcquireLeaseResult {
+                acquired: lease.holder == request.holder,
+                lease: lease.clone(),
+            });
+        }
+        let epoch = latest.map(|lease| lease.epoch + 1).unwrap_or(1);
+        let lease_id = Uuid7::now();
+        let add_result = self
+            .append_kernel_event_locked(EventData::LeaseAcquired {
+                lease_id,
+                holder: request.holder.clone(),
+                epoch,
+                ttl_ms: request.ttl_ms,
+            })
+            .await?;
+        let acquired_at = add_result
+            .latest_event_id
+            .timestamp()
+            .expect("uuid7 timestamp");
+        Ok(AcquireLeaseResult {
+            lease: LeaseState {
+                lease_id,
+                holder: request.holder,
+                epoch,
+                ttl_ms: request.ttl_ms,
+                expires_at: acquired_at + chrono::Duration::milliseconds(request.ttl_ms as i64),
+                released: false,
+            },
+            acquired: true,
+        })
+    }
+
+    async fn renew_lease(&self, request: RenewLeaseRequest) -> Result<LeaseState> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut lease = require_held_lease(
+            fold_lease(&events),
+            request.lease_id,
+            request.epoch,
+            "renew",
+        )?;
+        if !lease.is_live_at(Utc::now()) {
+            bail!(
+                "lease {} at epoch {} has expired; the thread is claimable",
+                lease.lease_id,
+                lease.epoch
+            );
+        }
+        let add_result = self
+            .append_kernel_event_locked(EventData::LeaseRenewed {
+                lease_id: request.lease_id,
+                epoch: request.epoch,
+                ttl_ms: request.ttl_ms,
+            })
+            .await?;
+        let renewed_at = add_result
+            .latest_event_id
+            .timestamp()
+            .expect("uuid7 timestamp");
+        lease.ttl_ms = request.ttl_ms;
+        lease.expires_at = renewed_at + chrono::Duration::milliseconds(request.ttl_ms as i64);
+        Ok(lease)
+    }
+
+    async fn release_lease(&self, request: ReleaseLeaseRequest) -> Result<LeaseState> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut lease = require_held_lease(
+            fold_lease(&events),
+            request.lease_id,
+            request.epoch,
+            "release",
+        )?;
+        // Already released (replay) or already expired: the thread is
+        // claimable either way; there is nothing left to record.
+        if lease.released || !lease.is_live_at(Utc::now()) {
+            return Ok(lease);
+        }
+        self.append_kernel_event_locked(EventData::LeaseReleased {
+            lease_id: request.lease_id,
+            epoch: request.epoch,
+        })
+        .await?;
+        lease.released = true;
+        Ok(lease)
+    }
+
+    async fn current_lease(&self) -> Result<Option<LeaseState>> {
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        Ok(fold_lease(&events).filter(|lease| lease.is_live_at(Utc::now())))
     }
 
     async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
@@ -2825,7 +2953,7 @@ impl BasicConversationHandle {
 
     /// Caller must hold `write_lock`: the fold that justified this append and
     /// the append itself have to see the same log.
-    async fn append_operation_event_locked(&self, data: EventData) -> Result<AddEventsResult> {
+    async fn append_kernel_event_locked(&self, data: EventData) -> Result<AddEventsResult> {
         let conversation_dir = self.conversation_dir();
         let mut record = self.load_record().await?;
         let add_result = append_events_to_conversation(
@@ -3339,6 +3467,26 @@ impl BasicSandboxScope for BasicTurnHandle {
     }
 }
 
+impl BasicTurnHandle {
+    /// Currency re-check on every commit: a turn whose epoch went stale — or
+    /// a pre-lease turn overtaken by a newly acquired lease — fails here
+    /// structurally, not by its holder's good behavior. Caller must hold
+    /// `write_lock`.
+    async fn ensure_turn_current_locked(&self) -> Result<()> {
+        let events = load_events(
+            &self.harness.inner.storage,
+            &self.conversation_dir.join("events"),
+        )
+        .await?;
+        ensure_current_epoch(
+            fold_lease(&events).as_ref(),
+            self.record.epoch,
+            Utc::now(),
+            "turn commit",
+        )
+    }
+}
+
 #[async_trait]
 impl TurnHandle for BasicTurnHandle {
     fn record(&self) -> &TurnRecord {
@@ -3346,8 +3494,9 @@ impl TurnHandle for BasicTurnHandle {
     }
 
     async fn add_events(&self, data: Vec<EventData>) -> Result<AddEventsResult> {
-        ensure_no_operation_events(&data)?;
+        ensure_appendable_events(&data)?;
         let _guard = self.harness.inner.write_lock.lock().await;
+        self.ensure_turn_current_locked().await?;
         let mut record = self
             .harness
             .inner
@@ -3381,6 +3530,7 @@ impl TurnHandle for BasicTurnHandle {
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
         let _guard = self.harness.inner.write_lock.lock().await;
+        self.ensure_turn_current_locked().await?;
         let mut record = self
             .harness
             .inner
@@ -3432,6 +3582,7 @@ impl TurnHandle for BasicTurnHandle {
                     .ok_or_else(|| anyhow!("turn has no latest event id"));
             }
         }
+        self.ensure_turn_current_locked().await?;
         let mut record = self
             .harness
             .inner
@@ -4080,19 +4231,85 @@ async fn append_events_to_conversation(
     })
 }
 
-/// Operation events are minted only by `begin_operation` and
-/// `complete_operation` — the dedupe and conflict checks live there, so a
-/// direct append would be an unchecked journal write.
-fn ensure_no_operation_events(data: &[EventData]) -> Result<()> {
+/// Kernel-lifecycle kinds are minted only by their own APIs. Rejecting them
+/// on the public append paths is what closes the fences: a writer that
+/// cannot forge lifecycle, operation, or lease records has no channel around
+/// the epoch checks. Producer-class kinds — messages, tool traffic, stream
+/// chunks, errors, custom, sandbox observations — stay open; authenticating
+/// producers is a different layer.
+fn ensure_appendable_events(data: &[EventData]) -> Result<()> {
     for event in data {
         if matches!(
             event,
-            EventData::OperationIntent { .. } | EventData::OperationCompleted { .. }
+            EventData::OperationIntent { .. }
+                | EventData::OperationCompleted { .. }
+                | EventData::LeaseAcquired { .. }
+                | EventData::LeaseRenewed { .. }
+                | EventData::LeaseReleased { .. }
+                | EventData::ThreadCreated { .. }
+                | EventData::ThreadUpdated { .. }
+                | EventData::ThreadDeleted
+                | EventData::ThreadForked { .. }
+                | EventData::SessionStarted
+                | EventData::SessionEnded
+                | EventData::TurnStarted { .. }
+                | EventData::TurnEnded
+                | EventData::ArtifactWritten { .. }
         ) {
-            bail!("operation events are kernel-minted; use begin_operation and complete_operation");
+            bail!(
+                "{} events are kernel-minted and cannot be appended directly",
+                event.kind().as_str()
+            );
         }
     }
     Ok(())
+}
+
+/// The fencing rule at an authority gate: while a lease is live the caller
+/// must present its current epoch; with no live lease only None passes — a
+/// presented epoch with nothing to fence against is a stale activation.
+fn ensure_current_epoch(
+    lease: Option<&LeaseState>,
+    epoch: Option<u64>,
+    now: DateTime<Utc>,
+    what: &str,
+) -> Result<()> {
+    let live = lease.filter(|lease| lease.is_live_at(now));
+    match (live, epoch) {
+        (Some(lease), Some(epoch)) if epoch == lease.epoch => Ok(()),
+        (Some(lease), Some(epoch)) => bail!(
+            "{what} carries stale epoch {epoch}; the live lease is at epoch {}",
+            lease.epoch
+        ),
+        (Some(lease), None) => bail!(
+            "{what} requires the live lease's epoch {}: unfenced writes during a live lease are zombie writes",
+            lease.epoch
+        ),
+        (None, None) => Ok(()),
+        (None, Some(epoch)) => bail!("{what} carries epoch {epoch} but no lease is live"),
+    }
+}
+
+/// Renew and release act only on the exact lease the caller was granted; a
+/// mismatch means a newer acquisition superseded it — the loud stale-epoch
+/// error the holder must obey.
+fn require_held_lease(
+    latest: Option<LeaseState>,
+    lease_id: LeaseId,
+    epoch: u64,
+    what: &str,
+) -> Result<LeaseState> {
+    let Some(lease) = latest else {
+        bail!("cannot {what}: the thread has no lease");
+    };
+    if lease.lease_id != lease_id || lease.epoch != epoch {
+        bail!(
+            "cannot {what} lease {lease_id} at epoch {epoch}: superseded by lease {} at epoch {}",
+            lease.lease_id,
+            lease.epoch
+        );
+    }
+    Ok(lease)
 }
 
 fn ensure_conversation_head(

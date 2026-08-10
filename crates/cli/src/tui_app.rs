@@ -601,6 +601,7 @@ impl TuiApp {
         let session_id = self.session_id;
         tokio::spawn(async move {
             let request = SendRequest {
+                epoch: None,
                 input: vec![Message::User {
                     content: UserContent::String(text),
                 }],

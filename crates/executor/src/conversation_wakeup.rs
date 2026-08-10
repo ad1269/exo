@@ -1,15 +1,20 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Context;
-use exoharness::Result;
+use exoharness::{AcquireLeaseRequest, ReleaseLeaseRequest, RenewLeaseRequest, Result, Uuid7};
 use lingua::Message;
 use lingua::universal::UserContent;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{HarnessConversation, SendRequest, SendResult};
+
+/// TTL ~4x the renewal cadence: a healthy holder renews three times before
+/// its lease could lapse.
+const WAKEUP_LEASE_TTL_MS: u64 = 60_000;
+const WAKEUP_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
+const WAKEUP_ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 pub async fn send_conversation_wakeup(
     conversation: &dyn HarnessConversation,
@@ -20,83 +25,78 @@ pub async fn send_conversation_wakeup(
 
 /// Wakeup variant for multimodal content, e.g. adapter messages that carry
 /// inbound images for the model to analyze.
+///
+/// The send runs under a kernel turn lease: acquired before the turn, renewed
+/// on a heartbeat, released after. A failed renewal means a newer activation
+/// owns the thread — the send future is dropped on the spot, and anything it
+/// might still have attempted is fenced kernel-side by the turn's epoch.
 pub async fn send_conversation_wakeup_content(
     conversation: &dyn HarnessConversation,
     content: UserContent,
 ) -> Result<SendResult> {
-    let _file_guard = WakeupFileLock::acquire(&conversation.record().id.to_string()).await?;
-    let result = conversation
-        .send(SendRequest {
-            input: vec![Message::User { content }],
-            session_id: None,
-        })
-        .await?;
-    conversation.close_session(result.session_id).await?;
-    Ok(result)
-}
+    let handle = conversation.exoharness_handle();
+    // One activation per wakeup call: a restarted process must never look
+    // like the prior holder still being alive.
+    let holder = format!("wakeup-{}", Uuid7::now());
+    let lease = loop {
+        let attempt = handle
+            .acquire_lease(AcquireLeaseRequest {
+                holder: holder.clone(),
+                ttl_ms: WAKEUP_LEASE_TTL_MS,
+            })
+            .await?;
+        if attempt.acquired {
+            break attempt.lease;
+        }
+        tokio::time::sleep(WAKEUP_ACQUIRE_RETRY_INTERVAL).await;
+    };
 
-struct WakeupFileLock {
-    path: PathBuf,
-}
-
-impl WakeupFileLock {
-    async fn acquire(conversation_id: &str) -> Result<Self> {
-        let dir = std::env::temp_dir().join("exo-wakeup-locks");
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join(format!("{conversation_id}.lock"));
+    let renew = async {
         loop {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
+            tokio::time::sleep(WAKEUP_LEASE_RENEW_INTERVAL).await;
+            if let Err(error) = handle
+                .renew_lease(RenewLeaseRequest {
+                    lease_id: lease.lease_id,
+                    epoch: lease.epoch,
+                    ttl_ms: WAKEUP_LEASE_TTL_MS,
+                })
                 .await
             {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    remove_stale_lock(&path).await?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to acquire wakeup lock {}", path.display())
-                    });
-                }
+                break error;
             }
         }
-    }
-}
-
-impl Drop for WakeupFileLock {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            tracing::error!(
-                path = %self.path.display(),
-                %error,
-                "failed to remove wakeup lock"
-            );
+    };
+    let send_result = tokio::select! {
+        result = conversation.send(SendRequest {
+            input: vec![Message::User { content }],
+            session_id: None,
+            epoch: Some(lease.epoch),
+        }) => result,
+        error = renew => {
+            // Fenced: the thread has a newer owner. No release — the lease
+            // being renewed is no longer ours to end.
+            return Err(error).context("wakeup fenced mid-send: a newer activation owns the thread");
+        }
+    };
+    let release = ReleaseLeaseRequest {
+        lease_id: lease.lease_id,
+        epoch: lease.epoch,
+    };
+    match send_result {
+        Ok(result) => {
+            conversation.close_session(result.session_id).await?;
+            handle.release_lease(release).await?;
+            Ok(result)
+        }
+        Err(error) => {
+            // Release anyway so the thread reopens now rather than at TTL;
+            // the send error is the one worth returning.
+            if let Err(release_error) = handle.release_lease(release).await {
+                tracing::warn!(%release_error, "failed to release the wakeup lease after a send error");
+            }
+            Err(error)
         }
     }
-}
-
-async fn remove_stale_lock(path: &PathBuf) -> Result<()> {
-    const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return Ok(());
-    };
-    let Ok(modified) = metadata.modified() else {
-        return Ok(());
-    };
-    if SystemTime::now()
-        .duration_since(modified)
-        .is_ok_and(|age| age > STALE_AFTER)
-    {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn conversation_send_lock(conversation_id: &str) -> Arc<AsyncMutex<()>> {
@@ -110,34 +110,4 @@ pub(crate) fn conversation_send_lock(conversation_id: &str) -> Arc<AsyncMutex<()
             .entry(conversation_id.to_string())
             .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::pin::pin;
-
-    use exoharness::Uuid7;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn wakeup_file_lock_serializes_conversation_ids() {
-        let conversation_id = format!("test-{}", Uuid7::now());
-        let first = WakeupFileLock::acquire(&conversation_id).await.unwrap();
-        let mut second = pin!(WakeupFileLock::acquire(&conversation_id));
-
-        tokio::select! {
-            _ = &mut second => {
-                panic!("second lock acquired while first lock was held");
-            }
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-
-        drop(first);
-        let second = tokio::time::timeout(Duration::from_secs(1), second)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(second);
-    }
 }

@@ -1,17 +1,18 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AddEventsRequest, AddEventsResult, AgentId, AgentRecord, Artifact, ArtifactVersion,
-    AttachSandboxRequest, BeginOperationRequest, BeginOperationResult, BeginTurnRequest, Binding,
-    BindingId, BindingRecord, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
-    CompleteOperationRequest, ConversationId, CreateSandboxRequest, Event, EventData, EventId,
-    EventQuery, ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    AcquireLeaseRequest, AcquireLeaseResult, AddEventsRequest, AddEventsResult, AgentId,
+    AgentRecord, Artifact, ArtifactVersion, AttachSandboxRequest, BeginOperationRequest,
+    BeginOperationResult, BeginTurnRequest, Binding, BindingId, BindingRecord,
+    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, CompleteOperationRequest,
+    ConversationId, CreateSandboxRequest, Event, EventData, EventId, EventQuery,
+    ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult, LeaseState,
     ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
-    OperationRecord, PutSecretRequest, ReadArtifactRequest, SandboxAttachment, SandboxId,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
-    ThreadRecord, TurnId, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
-    WriteSandboxProcessInputRequest,
+    OperationRecord, PutSecretRequest, ReadArtifactRequest, ReleaseLeaseRequest, RenewLeaseRequest,
+    SandboxAttachment, SandboxId, SandboxProcessEventQuery, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId, TurnRecord,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,6 +242,25 @@ pub enum Request {
         agent_id: AgentId,
         conversation_id: ConversationId,
     },
+    ConversationAcquireLease {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+        request: AcquireLeaseRequest,
+    },
+    ConversationRenewLease {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+        request: RenewLeaseRequest,
+    },
+    ConversationReleaseLease {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+        request: ReleaseLeaseRequest,
+    },
+    ConversationCurrentLease {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+    },
     ConversationFork {
         agent_id: AgentId,
         conversation_id: ConversationId,
@@ -357,6 +377,10 @@ impl Request {
             Self::ConversationBeginOperation { .. } => "conversation_begin_operation",
             Self::ConversationCompleteOperation { .. } => "conversation_complete_operation",
             Self::ConversationOpenOperations { .. } => "conversation_open_operations",
+            Self::ConversationAcquireLease { .. } => "conversation_acquire_lease",
+            Self::ConversationRenewLease { .. } => "conversation_renew_lease",
+            Self::ConversationReleaseLease { .. } => "conversation_release_lease",
+            Self::ConversationCurrentLease { .. } => "conversation_current_lease",
             Self::ConversationFork { .. } => "conversation_fork",
             Self::ConversationListArtifacts { .. } => "conversation_list_artifacts",
             Self::ConversationReadArtifact { .. } => "conversation_read_artifact",
@@ -409,6 +433,15 @@ pub enum Response {
     },
     Operations {
         operations: Vec<OperationRecord>,
+    },
+    AcquireLease {
+        result: AcquireLeaseResult,
+    },
+    Lease {
+        lease: LeaseState,
+    },
+    CurrentLease {
+        lease: Option<LeaseState>,
     },
     SessionId {
         session_id: SessionId,
@@ -481,6 +514,9 @@ impl Response {
             Self::BeginOperation { .. } => "begin_operation",
             Self::Operation { .. } => "operation",
             Self::Operations { .. } => "operations",
+            Self::AcquireLease { .. } => "acquire_lease",
+            Self::Lease { .. } => "lease",
+            Self::CurrentLease { .. } => "current_lease",
             Self::SessionId { .. } => "session_id",
             Self::ArtifactVersions { .. } => "artifact_versions",
             Self::Artifact { .. } => "artifact",
