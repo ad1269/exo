@@ -9,10 +9,11 @@ use tokio::time::timeout;
 use tracing::info;
 
 use crate::{
-    AddEventsRequest, BeginTurnRequest, Binding, EventData, EventKind, EventQuery,
-    EventQueryDirection, ExoHarness, ForkConversationRequest, ListConversationsRequest,
-    ListThreadsRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, NewThreadRequest, SandboxCommand, SandboxRequest, ThreadHandle, Uuid7,
+    AddEventsRequest, BeginOperationRequest, BeginTurnRequest, Binding, CompleteOperationRequest,
+    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, ForkConversationRequest,
+    ListConversationsRequest, ListThreadsRequest, ManagedSandboxBackend, ManagedSandboxHandle,
+    NewAgentRequest, NewConversationRequest, NewThreadRequest, OperationOutcome, OperationState,
+    RecoveryBudget, RecoveryPolicy, SandboxCommand, SandboxRequest, ThreadHandle, Uuid7,
     WriteArtifactRequest,
 };
 
@@ -383,6 +384,242 @@ pub async fn turn_events_continue_after_artifact_writes(harness: Arc<dyn ExoHarn
     let artifact_event = events.first().expect("artifact_written event");
     assert_eq!(artifact_event.session_id, Some(turn.record().session_id));
     assert_eq!(artifact_event.turn_id, Some(turn.record().id));
+}
+
+pub async fn operation_records_cover_the_crash_table(harness: Arc<dyn ExoHarness>) {
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: unique_slug("agent"),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let send = |key: &str| BeginOperationRequest {
+        effect_kind: "adapter.send".to_string(),
+        idempotency_key: key.to_string(),
+        recovery_policy: RecoveryPolicy::Reconcile,
+        budget: RecoveryBudget {
+            max_attempts: Some(3),
+            ..Default::default()
+        },
+    };
+
+    // T0: a crash before intent leaves no record — replay re-decides.
+    assert!(
+        conversation
+            .open_operations()
+            .await
+            .expect("open operations")
+            .is_empty()
+    );
+    let begun = conversation
+        .begin_operation(send("send-1"))
+        .await
+        .expect("intent");
+    assert!(begun.created);
+    assert_eq!(begun.operation.state, OperationState::Open);
+    assert_eq!(begun.operation.budget.max_attempts, Some(3));
+
+    // T1: intent recorded, effect not performed — the operation is on the
+    // reconcile list, and a replayed begin resumes it under the same id.
+    let open = conversation
+        .open_operations()
+        .await
+        .expect("open operations");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].operation_id, begun.operation.operation_id);
+    let resumed = conversation
+        .begin_operation(send("send-1"))
+        .await
+        .expect("resumed begin");
+    assert!(!resumed.created);
+    assert_eq!(resumed.operation.operation_id, begun.operation.operation_id);
+
+    // T2: the attempt ended without an answer. Uncertain keeps the operation
+    // on the reconcile list; re-reporting it is idempotent.
+    let uncertain = conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: begun.operation.operation_id,
+            outcome: OperationOutcome::Uncertain,
+            detail: Some("timed out mid-send".to_string()),
+        })
+        .await
+        .expect("uncertain completion");
+    assert_eq!(uncertain.state, OperationState::Uncertain);
+    assert_eq!(
+        conversation
+            .open_operations()
+            .await
+            .expect("open operations")
+            .len(),
+        1
+    );
+    let replayed_uncertain = conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: begun.operation.operation_id,
+            outcome: OperationOutcome::Uncertain,
+            detail: Some("timed out mid-send".to_string()),
+        })
+        .await
+        .expect("replayed uncertain completion");
+    assert_eq!(replayed_uncertain.state, OperationState::Uncertain);
+
+    // Reconciliation finds the effect landed: settle as succeeded.
+    let settled = conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: begun.operation.operation_id,
+            outcome: OperationOutcome::Succeeded,
+            detail: None,
+        })
+        .await
+        .expect("settled completion");
+    assert_eq!(settled.state, OperationState::Succeeded);
+    assert!(
+        conversation
+            .open_operations()
+            .await
+            .expect("open operations")
+            .is_empty()
+    );
+
+    // T3: a closed record dedupes the retry at begin — the caller skips.
+    let skipped = conversation
+        .begin_operation(send("send-1"))
+        .await
+        .expect("deduped begin");
+    assert!(!skipped.created);
+    assert_eq!(skipped.operation.state, OperationState::Succeeded);
+
+    // A replayed completion is acknowledged; uncertain is absorbed by the
+    // settled outcome; a conflicting outcome is refused.
+    let acknowledged = conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: begun.operation.operation_id,
+            outcome: OperationOutcome::Succeeded,
+            detail: None,
+        })
+        .await
+        .expect("replayed terminal completion");
+    assert_eq!(acknowledged.state, OperationState::Succeeded);
+    let absorbed = conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: begun.operation.operation_id,
+            outcome: OperationOutcome::Uncertain,
+            detail: None,
+        })
+        .await
+        .expect("uncertain after terminal");
+    assert_eq!(absorbed.state, OperationState::Succeeded);
+    assert!(
+        conversation
+            .complete_operation(CompleteOperationRequest {
+                operation_id: begun.operation.operation_id,
+                outcome: OperationOutcome::Failed,
+                detail: None,
+            })
+            .await
+            .is_err()
+    );
+
+    // Completions must name an operation the journal knows.
+    assert!(
+        conversation
+            .complete_operation(CompleteOperationRequest {
+                operation_id: Uuid7::now(),
+                outcome: OperationOutcome::Succeeded,
+                detail: None,
+            })
+            .await
+            .is_err()
+    );
+
+    // A key belongs to one effect kind.
+    assert!(
+        conversation
+            .begin_operation(BeginOperationRequest {
+                effect_kind: "adapter.react".to_string(),
+                idempotency_key: "send-1".to_string(),
+                recovery_policy: RecoveryPolicy::Retry,
+                budget: RecoveryBudget::default(),
+            })
+            .await
+            .is_err()
+    );
+
+    // A terminal failure releases its key; the superseding retry keeps the
+    // key so the destination still dedupes against the failed run.
+    let failed = conversation
+        .begin_operation(send("send-2"))
+        .await
+        .expect("second intent");
+    conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: failed.operation.operation_id,
+            outcome: OperationOutcome::Failed,
+            detail: Some("destination rejected the payload".to_string()),
+        })
+        .await
+        .expect("failed completion");
+    assert!(
+        conversation
+            .open_operations()
+            .await
+            .expect("open operations")
+            .is_empty()
+    );
+    let superseding = conversation
+        .begin_operation(send("send-2"))
+        .await
+        .expect("superseding begin");
+    assert!(superseding.created);
+    assert_ne!(
+        superseding.operation.operation_id,
+        failed.operation.operation_id
+    );
+    assert_eq!(
+        superseding.operation.supersedes,
+        Some(failed.operation.operation_id)
+    );
+
+    // Operation events are kernel-minted: direct appends are refused.
+    assert!(
+        conversation
+            .add_events(AddEventsRequest {
+                session_id: None,
+                turn_id: None,
+                data: vec![EventData::OperationCompleted {
+                    operation_id: begun.operation.operation_id,
+                    outcome: OperationOutcome::Failed,
+                    detail: None,
+                }],
+            })
+            .await
+            .is_err()
+    );
+
+    // The journal shows the records through the standard event query.
+    let intents = conversation
+        .get_events(Some(EventQuery {
+            types: Some(vec![EventKind::OPERATION_INTENT]),
+            ..Default::default()
+        }))
+        .await
+        .expect("intent events")
+        .events;
+    assert_eq!(intents.len(), 3);
+    let completions = conversation
+        .get_events(Some(EventQuery {
+            types: Some(vec![EventKind::OPERATION_COMPLETED]),
+            ..Default::default()
+        }))
+        .await
+        .expect("completion events")
+        .events;
+    assert_eq!(completions.len(), 3);
 }
 
 pub async fn conversation_scope_overrides_agent_scope_and_fork_copies_bindings(

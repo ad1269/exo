@@ -19,17 +19,18 @@ use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
-    Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
-    BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
-    ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
-    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind, SnapshotPayload,
-    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    Artifact, ArtifactVersion, BasicExoHarness, BeginOperationRequest, BeginTurnRequest, Binding,
+    BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest, CompleteOperationRequest,
+    CreateSandboxRequest, DurableFileSystem, EventData, EventKind, EventQuery, EventQueryDirection,
+    ExoHarness, FileSystemMountMode, ForkConversationRequest, ManagedSandboxBackend,
+    ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, OperationOutcome,
+    OperationState, PutSecretRequest, RecoveryBudget, RecoveryPolicy, RunInSandboxRequest,
+    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
+    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
+    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind,
+    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -120,6 +121,118 @@ async fn basic_backend_contract_turn_events_continue_after_artifact_writes() {
             .expect("harness should initialize"),
     );
     crate::contract_tests::turn_events_continue_after_artifact_writes(harness).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_operation_records_cover_the_crash_table() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path()))
+            .await
+            .expect("harness should initialize"),
+    );
+    crate::contract_tests::operation_records_cover_the_crash_table(harness).await;
+}
+
+// The restart half of the crash table: a new harness over the same root is
+// the recovering process, and the reconcile list must survive into it.
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_operation_records_survive_restart() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let agent_id = agent.record().id;
+    let conversation_id = conversation.record().id;
+    let begun = conversation
+        .begin_operation(begin_send_request("send-1"))
+        .await
+        .expect("intent");
+    drop(conversation);
+    drop(agent);
+    drop(harness);
+
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should reopen");
+    let conversation = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup")
+        .expect("agent survives restart")
+        .get_conversation(&conversation_id)
+        .await
+        .expect("conversation lookup")
+        .expect("conversation survives restart");
+    let open = conversation
+        .open_operations()
+        .await
+        .expect("open operations");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].operation_id, begun.operation.operation_id);
+    assert_eq!(open[0].state, OperationState::Open);
+    let resumed = conversation
+        .begin_operation(begin_send_request("send-1"))
+        .await
+        .expect("resumed begin");
+    assert!(!resumed.created);
+    assert_eq!(resumed.operation.operation_id, begun.operation.operation_id);
+    conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: begun.operation.operation_id,
+            outcome: OperationOutcome::Succeeded,
+            detail: None,
+        })
+        .await
+        .expect("completion");
+    drop(conversation);
+    drop(harness);
+
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should reopen again");
+    let conversation = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup")
+        .expect("agent survives restart")
+        .get_conversation(&conversation_id)
+        .await
+        .expect("conversation lookup")
+        .expect("conversation survives restart");
+    assert!(
+        conversation
+            .open_operations()
+            .await
+            .expect("open operations")
+            .is_empty()
+    );
+    let deduped = conversation
+        .begin_operation(begin_send_request("send-1"))
+        .await
+        .expect("deduped begin");
+    assert!(!deduped.created);
+    assert_eq!(deduped.operation.state, OperationState::Succeeded);
+}
+
+fn begin_send_request(key: &str) -> BeginOperationRequest {
+    BeginOperationRequest {
+        effect_kind: "adapter.send".to_string(),
+        idempotency_key: key.to_string(),
+        recovery_policy: RecoveryPolicy::Reconcile,
+        budget: RecoveryBudget::default(),
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
