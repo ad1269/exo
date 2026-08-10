@@ -516,6 +516,166 @@ fn find_events_dir(root: &std::path::Path, known_event_file: &str) -> std::path:
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn basic_backend_fork_by_reference_contract() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path()))
+            .await
+            .expect("harness should initialize"),
+    );
+    crate::contract_tests::fork_by_reference_preserves_identity_and_scopes_authority(harness).await;
+}
+
+// The anchor crash case: fork rides the acknowledged-append path, so a fork
+// that returned survives a restart whole — the anchor, the pinned cursor,
+// and the composed read all come back identical. (A crash BEFORE the anchor
+// lands leaves no readable fork: the record.json that makes the child
+// visible is written only after the anchor.)
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_fork_anchor_survives_restart() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let parent = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("parent");
+    parent
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::Custom {
+                event_type: "tick".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+        })
+        .await
+        .expect("append");
+    let child = parent
+        .fork(ForkConversationRequest::default())
+        .await
+        .expect("fork");
+    let agent_id = agent.record().id;
+    let child_id = child.record().id;
+    let before = child
+        .get_events(None)
+        .await
+        .expect("child read")
+        .events
+        .iter()
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    drop(child);
+    drop(parent);
+    drop(agent);
+    drop(harness);
+
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should reopen");
+    let child = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup")
+        .expect("agent survives restart")
+        .get_conversation(&child_id)
+        .await
+        .expect("child lookup")
+        .expect("the fork survives restart whole");
+    let after = child
+        .get_events(None)
+        .await
+        .expect("child read after restart")
+        .events
+        .iter()
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    assert_eq!(before, after, "the composed journal is restart-stable");
+}
+
+// Journals from before fork-by-reference carry a marker-less ThreadForked
+// over re-minted copies; they must read exactly as the self-contained
+// streams they are — no reference resolution attempted.
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_legacy_copied_forks_stay_valid() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let created = conversation
+        .get_events(None)
+        .await
+        .expect("events")
+        .events
+        .pop()
+        .expect("thread created event");
+    // Plant a legacy anchor — marker-less ThreadForked naming a thread that
+    // does not even exist, as a copied fork legitimately can (its source may
+    // have been deleted long ago; nothing was pinned before M4).
+    let events_dir = find_events_dir(tempdir.path(), &created.id.to_string());
+    let legacy_id = Uuid7::now();
+    let legacy = Event {
+        id: legacy_id,
+        thread_id: conversation.record().id,
+        session_id: None,
+        turn_id: None,
+        created_at: legacy_id.timestamp().expect("uuid7 timestamp"),
+        data: EventData::ThreadForked {
+            source_thread_id: Uuid7::now(),
+            up_to_inclusive: None,
+            representation: None,
+        },
+    };
+    std::fs::write(
+        events_dir.join(format!("{legacy_id}.json")),
+        serde_json::to_vec_pretty(&legacy).expect("serialize"),
+    )
+    .expect("plant legacy anchor");
+
+    let events = conversation
+        .get_events(None)
+        .await
+        .expect("legacy journal reads")
+        .events;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.data, EventData::ThreadForked { .. })),
+        "the legacy fork event is ordinary history"
+    );
+    conversation
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::Custom {
+                event_type: "still-writable".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+        })
+        .await
+        .expect("legacy journals stay writable");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn basic_backend_contract_conversation_scope_overrides_and_forks() {
     let tempdir = TempDir::new().expect("tempdir");
     let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(

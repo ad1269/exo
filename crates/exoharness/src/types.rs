@@ -494,7 +494,13 @@ pub enum EventData {
     ThreadForked {
         #[serde(alias = "source_conversation_id")]
         source_thread_id: ThreadId,
+        /// For a referenced fork this is always the concrete cut id, pinned
+        /// at fork time — a child's prefix must never grow with its parent.
         up_to_inclusive: Option<EventId>,
+        /// Absent on journals written before fork-by-reference: those forks
+        /// carry full re-minted copies and stay valid as they are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        representation: Option<ForkRepresentation>,
     },
     SessionStarted,
     SessionEnded,
@@ -679,6 +685,18 @@ impl EventData {
             Self::Custom { event_type, .. } => EventKind::custom(event_type.clone()),
         }
     }
+}
+
+/// How a fork relates to its parent's events. `Copied` re-minted the prefix
+/// into the child (the pre-M4 behavior, still what materialization would
+/// produce — though a materializer preserves ids where the legacy path did
+/// not); `Referenced` keeps the parent's events as the child's prefix, ids
+/// and bytes intact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkRepresentation {
+    Copied,
+    Referenced,
 }
 
 pub type OperationId = Uuid7;
@@ -904,9 +922,18 @@ pub struct NondeterminismRecord {
 /// Replays lease events to the latest lease, in event order. Expiry is not
 /// an event: an expired lease is simply not live at read time, which is what
 /// makes the stream claimable again without kernel timers.
-pub fn fold_lease(events: &[Event]) -> Option<LeaseState> {
+///
+/// `fork_boundary` scopes the fold to a child's own tail: a lease authorizes
+/// an activation on one stream, so the parent's lease never crosses the cut
+/// and a child's first acquire mints epoch 1.
+pub fn fold_lease(events: &[Event], fork_boundary: Option<EventId>) -> Option<LeaseState> {
     let mut lease: Option<LeaseState> = None;
     for event in events {
+        if let Some(boundary) = fork_boundary
+            && event.id <= boundary
+        {
+            continue;
+        }
         match &event.data {
             EventData::LeaseAcquired {
                 lease_id,
@@ -956,7 +983,25 @@ pub fn fold_lease(events: &[Event]) -> Option<LeaseState> {
 /// any event sequence: completions for unknown operations are dropped, and a
 /// terminal state only changes by this fold never — later completions that
 /// disagree were already rejected at the API.
-pub fn fold_operations(events: &[Event]) -> Vec<OperationRecord> {
+///
+/// `fork_boundary` is the referenced-fork cut, when the events are a child's
+/// composed journal: operations that are non-terminal at the cut are dropped
+/// — the attempt belongs to the parent's activation, and the drop is
+/// information-forced, not merely policy: a completion recorded after the
+/// cut lies outside the child's prefix, so the child cannot see it even in
+/// principle. Terminal-at-the-cut operations are shared history and keep
+/// deduplicating the child's begins.
+pub fn fold_operations(events: &[Event], fork_boundary: Option<EventId>) -> Vec<OperationRecord> {
+    let mut operations = fold_all_operations(events);
+    if let Some(boundary) = fork_boundary {
+        operations.retain(|operation| {
+            operation.state.is_terminal() || operation.intent_event_id > boundary
+        });
+    }
+    operations
+}
+
+fn fold_all_operations(events: &[Event]) -> Vec<OperationRecord> {
     let mut operations: Vec<OperationRecord> = Vec::new();
     for event in events {
         match &event.data {
@@ -1578,12 +1623,14 @@ mod tests {
             EventData::ThreadForked {
                 source_thread_id: actual,
                 up_to_inclusive: None,
+                representation: None,
             } if actual == source_thread_id
         ));
 
         let value = serde_json::to_value(EventData::ThreadForked {
             source_thread_id,
             up_to_inclusive: None,
+            representation: None,
         })
         .expect("thread fork event should serialize");
         assert_eq!(value["type"], "thread_forked");

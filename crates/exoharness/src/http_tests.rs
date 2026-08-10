@@ -133,6 +133,15 @@ async fn http_exoharness_journal_reads_are_replayable() {
 }
 
 #[actix_web::test]
+async fn http_exoharness_fork_by_reference_contract() {
+    let fixture = http_harness().await;
+    crate::contract_tests::fork_by_reference_preserves_identity_and_scopes_authority(Arc::clone(
+        &fixture.harness,
+    ))
+    .await;
+}
+
+#[actix_web::test]
 async fn http_exoharness_conversation_scope_overrides_and_forks() {
     let fixture = http_harness().await;
     crate::contract_tests::conversation_scope_overrides_agent_scope_and_fork_copies_bindings(

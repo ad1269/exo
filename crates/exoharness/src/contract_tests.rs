@@ -1214,6 +1214,323 @@ fn user_event(text: &str) -> EventData {
     }
 }
 
+pub async fn fork_by_reference_preserves_identity_and_scopes_authority(
+    harness: Arc<dyn ExoHarness>,
+) {
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: unique_slug("agent"),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let parent = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("parent");
+    let send = |key: &str| BeginOperationRequest {
+        effect_kind: "adapter.send".to_string(),
+        idempotency_key: key.to_string(),
+        recovery_policy: RecoveryPolicy::Reconcile,
+        budget: RecoveryBudget::default(),
+        epoch: None,
+    };
+
+    for i in 0..3 {
+        parent
+            .add_events(AddEventsRequest {
+                session_id: None,
+                turn_id: None,
+                data: vec![user_event(&format!("before the cut {i}"))],
+            })
+            .await
+            .expect("parent append");
+    }
+    // Operation A: terminal before the cut — shared history.
+    let op_a = parent.begin_operation(send("key-a")).await.expect("op a");
+    parent
+        .complete_operation(CompleteOperationRequest {
+            operation_id: op_a.operation.operation_id,
+            outcome: OperationOutcome::Succeeded,
+            detail: None,
+            epoch: None,
+        })
+        .await
+        .expect("op a settles");
+    // Operations B and C: open at the cut. C will complete parent-side
+    // AFTER the fork — the ruling's sharpest edge.
+    let op_b = parent.begin_operation(send("key-b")).await.expect("op b");
+    let op_c = parent.begin_operation(send("key-c")).await.expect("op c");
+    assert!(op_b.created && op_c.created);
+
+    let parent_events = parent
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("parent read")
+        .events;
+    let cursor = parent_events.last().expect("parent has events").id;
+
+    let child = parent
+        .fork(ForkConversationRequest::default())
+        .await
+        .expect("fork");
+
+    // Parent completes C after the cut. The child's prefix ends at the
+    // cursor, so the child CANNOT see this completion even in principle —
+    // the drop below is information-forced, not merely policy.
+    parent
+        .complete_operation(CompleteOperationRequest {
+            operation_id: op_c.operation.operation_id,
+            outcome: OperationOutcome::Succeeded,
+            detail: Some("landed after the cut".to_string()),
+            epoch: None,
+        })
+        .await
+        .expect("op c settles parent-side");
+
+    // Identity: the child's prefix IS the parent's history — same ids, same
+    // bytes, no re-minting. The child's own tail is the single anchor.
+    let child_events = child
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("child read")
+        .events;
+    let (prefix, tail) = child_events.split_at(parent_events.len());
+    for (child_event, parent_event) in prefix.iter().zip(parent_events.iter()) {
+        assert_eq!(child_event.id, parent_event.id, "prefix ids are preserved");
+        assert_eq!(
+            serde_json::to_value(child_event).expect("serialize"),
+            serde_json::to_value(parent_event).expect("serialize"),
+            "prefix events are byte-identical history"
+        );
+    }
+    assert_eq!(tail.len(), 1, "the child's own tail is the anchor");
+    let EventData::ThreadForked {
+        source_thread_id,
+        up_to_inclusive,
+        representation,
+    } = &tail[0].data
+    else {
+        panic!("anchor should be the fork event");
+    };
+    assert_eq!(*source_thread_id, parent.record().id);
+    assert_eq!(
+        *up_to_inclusive,
+        Some(cursor),
+        "the cursor is pinned concrete"
+    );
+    assert!(
+        matches!(representation, Some(crate::ForkRepresentation::Referenced)),
+        "new forks carry the referenced marker"
+    );
+    assert!(
+        child_events.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "the composed stream keeps the order promise across the boundary"
+    );
+
+    // Cursor pagination walks the boundary seamlessly.
+    let mut paged = Vec::new();
+    let mut page_cursor = None;
+    loop {
+        let page = child
+            .get_events(Some(EventQuery {
+                direction: Some(EventQueryDirection::Asc),
+                cursor: page_cursor,
+                limit: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .expect("page");
+        if page.events.is_empty() {
+            break;
+        }
+        page_cursor = page.cursor;
+        paged.extend(page.events);
+    }
+    assert_eq!(
+        paged.iter().map(|event| event.id).collect::<Vec<_>>(),
+        child_events
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+    );
+
+    // M2 across the boundary. Terminal-at-the-cut is shared history: the
+    // child's begin on key-a dedupes against the parent's completion.
+    let deduped = child.begin_operation(send("key-a")).await.expect("dedupe");
+    assert!(!deduped.created);
+    assert_eq!(deduped.operation.state, OperationState::Succeeded);
+    // Open-at-the-cut does not cross: the attempt belongs to the parent's
+    // activation. Neither B (still open parent-side) nor C appears.
+    assert!(
+        child
+            .open_operations()
+            .await
+            .expect("child reconcile list")
+            .is_empty(),
+        "parent's in-flight operations do not cross the fork"
+    );
+    // THE NAMED CASE — completed-after-cursor: C settled parent-side after
+    // the fork, but that completion is outside the child's prefix. From the
+    // child, C is open-at-the-cut and dropped; the key is fresh-mintable
+    // with no supersession link. The destination's key dedupe is the
+    // cross-lineage rail.
+    let c_reminted = child
+        .begin_operation(send("key-c"))
+        .await
+        .expect("key-c reminted in child");
+    assert!(c_reminted.created, "completed-after-cursor does not cross");
+    assert_ne!(
+        c_reminted.operation.operation_id,
+        op_c.operation.operation_id
+    );
+    assert_eq!(c_reminted.operation.supersedes, None);
+    // And B likewise fresh-mintable.
+    let b_reminted = child
+        .begin_operation(send("key-b"))
+        .await
+        .expect("key-b reminted in child");
+    assert!(b_reminted.created);
+    assert_eq!(b_reminted.operation.supersedes, None);
+
+    // Child activity does not leak upstream: the parent still owns exactly
+    // its one open operation (B) and its head is untouched by child appends.
+    let parent_open = parent
+        .open_operations()
+        .await
+        .expect("parent reconcile list");
+    assert_eq!(parent_open.len(), 1);
+    assert_eq!(parent_open[0].operation_id, op_b.operation.operation_id);
+
+    // C4: a parent lease never fences the child, and child epochs restart.
+    let parent_lease = parent
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "parent-activation".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("parent lease");
+    assert!(parent_lease.acquired);
+    let unfenced = child
+        .begin_operation(send("key-d"))
+        .await
+        .expect("child initiates unfenced while parent holds a lease");
+    assert!(unfenced.created);
+    let child_lease = child
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "child-activation".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("child lease");
+    assert!(child_lease.acquired);
+    assert_eq!(child_lease.lease.epoch, 1, "child epochs restart at 1");
+
+    // Nested fork: the grandchild composes both prefixes.
+    let grandchild = child
+        .fork(ForkConversationRequest::default())
+        .await
+        .expect("grandchild");
+    let grandchild_events = grandchild
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("grandchild read")
+        .events;
+    let child_now = child
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("child read")
+        .events;
+    assert_eq!(
+        grandchild_events[..grandchild_events.len() - 1]
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        child_now.iter().map(|event| event.id).collect::<Vec<_>>(),
+        "the grandchild's prefix is the child's composed journal"
+    );
+
+    // D1: the parent is pinned by the child, the child by the grandchild;
+    // deleting leaf-first releases each pin in turn.
+    assert!(
+        agent
+            .delete_conversation(&parent.record().id)
+            .await
+            .is_err(),
+        "a referenced parent cannot be deleted"
+    );
+    assert!(
+        agent.delete_conversation(&child.record().id).await.is_err(),
+        "a referenced child that is itself referenced cannot be deleted"
+    );
+    assert!(
+        agent
+            .delete_conversation(&grandchild.record().id)
+            .await
+            .expect("delete grandchild")
+    );
+    assert!(
+        agent
+            .delete_conversation(&child.record().id)
+            .await
+            .expect("delete child after its pin is released")
+    );
+    assert!(
+        agent
+            .delete_conversation(&parent.record().id)
+            .await
+            .expect("delete parent last")
+    );
+
+    // A bogus cut is refused; a real mid-log cut pins exactly.
+    let short = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("short parent");
+    short
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![user_event("one"), user_event("two")],
+        })
+        .await
+        .expect("short append");
+    assert!(
+        short
+            .fork(ForkConversationRequest {
+                up_to_inclusive: Some(Uuid7::now()),
+                ..Default::default()
+            })
+            .await
+            .is_err(),
+        "a cut that is not an event of the thread is refused"
+    );
+    let short_events = short.get_events(None).await.expect("short read").events;
+    let mid = short_events[short_events.len() - 2].id;
+    let mid_fork = short
+        .fork(ForkConversationRequest {
+            up_to_inclusive: Some(mid),
+            ..Default::default()
+        })
+        .await
+        .expect("mid-log fork");
+    let mid_events = mid_fork.get_events(None).await.expect("mid read").events;
+    // Prefix ends exactly at the cut; the tail is the anchor.
+    assert_eq!(mid_events[mid_events.len() - 2].id, mid);
+}
+
 pub async fn conversation_scope_overrides_agent_scope_and_fork_copies_bindings(
     harness: Arc<dyn ExoHarness>,
 ) {

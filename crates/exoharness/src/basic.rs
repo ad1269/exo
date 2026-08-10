@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -39,17 +39,18 @@ use crate::{
     CompleteOperationRequest, ConversationHandle, ConversationId, ConversationRecord,
     CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
     EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, LeaseId, LeaseState, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, NondeterminismRecord,
-    OperationOutcome, OperationRecord, OperationState, PutSecretRequest, ReadArtifactRequest,
-    RecordNondeterminismRequest, RecordedValue, RecordedValueKind, ReleaseLeaseRequest,
-    RenewLeaseRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
-    SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
-    SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata,
-    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest, fold_lease, fold_operations,
+    ForkRepresentation, GetEventsResult, GetSandboxProcessEventsResult, LeaseId, LeaseState,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    NondeterminismRecord, OperationOutcome, OperationRecord, OperationState, PutSecretRequest,
+    ReadArtifactRequest, RecordNondeterminismRequest, RecordedValue, RecordedValueKind,
+    ReleaseLeaseRequest, RenewLeaseRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret,
+    SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest, fold_lease,
+    fold_operations,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1279,6 +1280,22 @@ impl AgentHandle for BasicAgentHandle {
         {
             return Ok(false);
         }
+        // Refcount pin: deleting this thread would destroy the prefix of
+        // every referenced fork below it. The global write lock makes the
+        // scan and the delete one atomic step against a concurrent fork.
+        let children =
+            referencing_children(&self.harness.inner.storage, &self.conversations_dir(), id)
+                .await?;
+        if !children.is_empty() {
+            bail!(
+                "thread {id} is pinned: referenced fork(s) {} depend on its events; delete the children first",
+                children
+                    .iter()
+                    .map(|child| child.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if let Ok(mut record) = self
             .harness
             .inner
@@ -2046,11 +2063,16 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let Some(name) = &request.name else {
             return Ok(None);
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.owner_dir.join("events"))
-            .await?
-            .into_iter()
-            .filter(|event| event.data.kind() == EventKind::SANDBOX_CREATED)
-            .collect::<Vec<_>>();
+        let conversation = match self.event_sink {
+            BasicSandboxEventSink::Conversation { conversation_id } => Some(conversation_id),
+            _ => None,
+        };
+        let mut events =
+            load_owner_journal(&self.harness.inner.storage, &self.owner_dir, conversation)
+                .await?
+                .into_iter()
+                .filter(|event| event.data.kind() == EventKind::SANDBOX_CREATED)
+                .collect::<Vec<_>>();
         events.sort_by_key(|event| event.id);
 
         for event in events.into_iter().rev() {
@@ -2221,9 +2243,10 @@ impl ConversationHandle for BasicConversationHandle {
 
     async fn begin_turn(&self, request: BeginTurnRequest) -> Result<Arc<dyn TurnHandle>> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let journal = self.journal().await?;
+        let events = journal.events;
         ensure_current_epoch(
-            fold_lease(&events).as_ref(),
+            fold_lease(&events, journal.fork_boundary).as_ref(),
             request.epoch,
             Utc::now(),
             "begin_turn",
@@ -2283,7 +2306,8 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>> {
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let journal = self.journal().await?;
+        let events = journal.events;
         let mut latest_event_id = None;
         let mut finished = false;
         let mut epoch = None;
@@ -2323,7 +2347,7 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn get_events(&self, query: Option<EventQuery>) -> Result<GetEventsResult> {
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut events = self.journal().await?.events;
         if let Some(query) = query {
             if let Some(session_id) = query.session_id {
                 events.retain(|event| event.session_id == Some(session_id));
@@ -2363,7 +2387,8 @@ impl ConversationHandle for BasicConversationHandle {
         let existing = match after_exclusive {
             Bound::Unbounded => Vec::new(),
             _ => {
-                let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+                let journal = self.journal().await?;
+                let events = journal.events;
                 events
                     .into_iter()
                     .filter(|event| matches_bound(event.id, &after_exclusive))
@@ -2387,7 +2412,12 @@ impl ConversationHandle for BasicConversationHandle {
 
     async fn get_event(&self, id: EventId) -> Result<Option<Event>> {
         let path = self.events_dir().join(format!("{id}.json"));
-        self.harness.inner.storage.get_json_if_exists(&path).await
+        if let Some(event) = self.harness.inner.storage.get_json_if_exists(&path).await? {
+            return Ok(Some(event));
+        }
+        // Not in the tail: a referenced fork's event may live in the prefix.
+        let journal = self.journal().await?;
+        Ok(journal.events.into_iter().find(|event| event.id == id))
     }
 
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult> {
@@ -2401,14 +2431,15 @@ impl ConversationHandle for BasicConversationHandle {
         request: BeginOperationRequest,
     ) -> Result<BeginOperationResult> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let journal = self.journal().await?;
+        let events = journal.events;
         ensure_current_epoch(
-            fold_lease(&events).as_ref(),
+            fold_lease(&events, journal.fork_boundary).as_ref(),
             request.epoch,
             Utc::now(),
             "begin_operation",
         )?;
-        let operations = fold_operations(&events);
+        let operations = fold_operations(&events, journal.fork_boundary);
         let prior = operations
             .iter()
             .rev()
@@ -2466,8 +2497,9 @@ impl ConversationHandle for BasicConversationHandle {
         request: CompleteOperationRequest,
     ) -> Result<OperationRecord> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
-        let mut operation = fold_operations(&events)
+        let journal = self.journal().await?;
+        let events = journal.events;
+        let mut operation = fold_operations(&events, journal.fork_boundary)
             .into_iter()
             .find(|operation| operation.operation_id == request.operation_id)
             .ok_or_else(|| anyhow!("unknown operation {}", request.operation_id))?;
@@ -2503,8 +2535,9 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn open_operations(&self) -> Result<Vec<OperationRecord>> {
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
-        Ok(fold_operations(&events)
+        let journal = self.journal().await?;
+        let events = journal.events;
+        Ok(fold_operations(&events, journal.fork_boundary)
             .into_iter()
             .filter(|operation| !operation.state.is_terminal())
             .collect())
@@ -2512,8 +2545,9 @@ impl ConversationHandle for BasicConversationHandle {
 
     async fn acquire_lease(&self, request: AcquireLeaseRequest) -> Result<AcquireLeaseResult> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
-        let latest = fold_lease(&events);
+        let journal = self.journal().await?;
+        let events = journal.events;
+        let latest = fold_lease(&events, journal.fork_boundary);
         let now = Utc::now();
         if let Some(lease) = &latest
             && lease.is_live_at(now)
@@ -2552,9 +2586,10 @@ impl ConversationHandle for BasicConversationHandle {
 
     async fn renew_lease(&self, request: RenewLeaseRequest) -> Result<LeaseState> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let journal = self.journal().await?;
+        let events = journal.events;
         let mut lease = require_held_lease(
-            fold_lease(&events),
+            fold_lease(&events, journal.fork_boundary),
             request.lease_id,
             request.epoch,
             "renew",
@@ -2584,9 +2619,10 @@ impl ConversationHandle for BasicConversationHandle {
 
     async fn release_lease(&self, request: ReleaseLeaseRequest) -> Result<LeaseState> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let journal = self.journal().await?;
+        let events = journal.events;
         let mut lease = require_held_lease(
-            fold_lease(&events),
+            fold_lease(&events, journal.fork_boundary),
             request.lease_id,
             request.epoch,
             "release",
@@ -2606,8 +2642,9 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn current_lease(&self) -> Result<Option<LeaseState>> {
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
-        Ok(fold_lease(&events).filter(|lease| lease.is_live_at(Utc::now())))
+        let journal = self.journal().await?;
+        let events = journal.events;
+        Ok(fold_lease(&events, journal.fork_boundary).filter(|lease| lease.is_live_at(Utc::now())))
     }
 
     async fn record_nondeterminism(
@@ -2615,9 +2652,10 @@ impl ConversationHandle for BasicConversationHandle {
         request: RecordNondeterminismRequest,
     ) -> Result<NondeterminismRecord> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let journal = self.journal().await?;
+        let events = journal.events;
         ensure_current_epoch(
-            fold_lease(&events).as_ref(),
+            fold_lease(&events, journal.fork_boundary).as_ref(),
             request.epoch,
             Utc::now(),
             "record_nondeterminism",
@@ -2678,10 +2716,29 @@ impl ConversationHandle for BasicConversationHandle {
             }
             None => derive_unique_slug("fork", &existing),
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
-        if let Some(limit) = request.up_to_inclusive {
-            events.retain(|event| event.id <= limit);
-        }
+        // Fork by reference: no event is copied or re-minted. The child's
+        // journal is the parent's composed prefix up to a cursor pinned NOW
+        // — a None request cut resolves to the current head, because a
+        // child's prefix must never grow with its parent.
+        let journal = self.journal().await?;
+        let cursor = match request.up_to_inclusive {
+            Some(limit) => {
+                if !journal.events.iter().any(|event| event.id == limit) {
+                    bail!(
+                        "fork cut {limit} is not an event of thread {}",
+                        self.record.id
+                    );
+                }
+                limit
+            }
+            None => {
+                journal
+                    .events
+                    .last()
+                    .expect("a thread has at least its creation event")
+                    .id
+            }
+        };
         let record = ConversationRecord {
             id: Uuid7::now(),
             slug: slug.clone(),
@@ -2710,36 +2767,11 @@ impl ConversationHandle for BasicConversationHandle {
             .copy_prefix(self.sandboxes_dir(), conversation_dir.join("sandboxes"))
             .await?;
 
-        let mut latest_event_id = None;
-        for mut event in events {
-            let new_event_id = Uuid7::now();
-            event.id = new_event_id;
-            event.thread_id = record.id;
-            event.created_at = new_event_id.timestamp().expect("uuid7 timestamp");
-            latest_event_id = Some(new_event_id);
-            self.harness
-                .inner
-                .storage
-                .put_json_fsync(
-                    conversation_dir
-                        .join("events")
-                        .join(format!("{}.json", event.id)),
-                    &event,
-                )
-                .await?;
-        }
-        // The copies are journal writes like any other: acknowledged means
-        // fsynced, one directory sync for the whole prefix.
-        if latest_event_id.is_some() {
-            self.harness
-                .inner
-                .storage
-                .sync_dir(conversation_dir.join("events"))
-                .await?;
-        }
-
         let mut fork_record = record.clone();
-        fork_record.latest_event_id = latest_event_id;
+        // The child's journal position starts at the cut: this floors the
+        // anchor's own id above the whole inherited prefix (the append path
+        // takes the max of the directory tail and the record head).
+        fork_record.latest_event_id = Some(cursor);
         append_events_to_conversation(
             &self.harness.inner,
             &conversation_dir,
@@ -2749,7 +2781,8 @@ impl ConversationHandle for BasicConversationHandle {
             fork_record.latest_event_id,
             vec![EventData::ThreadForked {
                 source_thread_id: self.record.id,
-                up_to_inclusive: request.up_to_inclusive,
+                up_to_inclusive: Some(cursor),
+                representation: Some(ForkRepresentation::Referenced),
             }],
             &mut fork_record,
         )
@@ -2993,6 +3026,19 @@ impl BasicConversationHandle {
             .storage
             .get_json(self.conversation_dir().join("record.json"))
             .await
+    }
+
+    fn conversations_dir(&self) -> PathBuf {
+        self.agent_dir().join("conversations")
+    }
+
+    async fn journal(&self) -> Result<Journal> {
+        load_journal(
+            &self.harness.inner.storage,
+            &self.conversations_dir(),
+            self.record.id,
+        )
+        .await
     }
 
     /// Caller must hold `write_lock`: the fold that justified this append and
@@ -3407,10 +3453,10 @@ async fn load_sandbox_provider_state(
     provider: SandboxProvider,
     state_key: &str,
 ) -> Result<Option<Value>> {
-    let SandboxOwner::Conversation(_) = owner else {
+    let SandboxOwner::Conversation(conversation_id) = owner else {
         return Ok(None);
     };
-    let mut events = load_events(&harness.inner.storage, &owner_dir.join("events"))
+    let mut events = load_owner_journal(&harness.inner.storage, owner_dir, Some(conversation_id))
         .await?
         .into_iter()
         .filter(|event| event.data.kind() == EventKind::custom(SANDBOX_PROVIDER_STATE_EVENT))
@@ -3515,13 +3561,19 @@ impl BasicTurnHandle {
     /// structurally, not by its holder's good behavior. Caller must hold
     /// `write_lock`.
     async fn ensure_turn_current_locked(&self) -> Result<()> {
-        let events = load_events(
+        let conversations_dir = self
+            .conversation_dir
+            .parent()
+            .expect("conversation dir has a parent")
+            .to_path_buf();
+        let journal = load_journal(
             &self.harness.inner.storage,
-            &self.conversation_dir.join("events"),
+            &conversations_dir,
+            self.conversation_id,
         )
         .await?;
         ensure_current_epoch(
-            fold_lease(&events).as_ref(),
+            fold_lease(&journal.events, journal.fork_boundary).as_ref(),
             self.record.epoch,
             Utc::now(),
             "turn commit",
@@ -4244,7 +4296,9 @@ async fn append_events_to_conversation(
     let events_dir = conversation_dir.join("events");
     // The directory scan, not record.json, is the authoritative tail: the
     // record is a cache that can lag by a crash.
-    let mut head = journal_head(&inner.storage, &events_dir).await?;
+    let mut head = journal_floor(&inner.storage, &events_dir)
+        .await?
+        .max(record.latest_event_id);
     let mut event_ids = Vec::new();
     let mut pending = Vec::new();
     for data in data {
@@ -4279,19 +4333,189 @@ async fn append_events_to_conversation(
 }
 
 /// The journal's tail by lexical filename order — uuid ids sort the same as
-/// their bytes, so the last key is the greatest event id.
-async fn journal_head(storage: &BasicObjectStore, events_dir: &Path) -> Result<Option<EventId>> {
+/// their bytes, so the last key is the greatest event id. For a referenced
+/// fork the floor also covers the reference cursor: the child's first own
+/// events (the anchor included) must sort above the whole inherited prefix,
+/// or M1's order promise would break across the boundary.
+async fn journal_floor(storage: &BasicObjectStore, events_dir: &Path) -> Result<Option<EventId>> {
     let keys = storage.list_keys(events_dir).await?;
-    Ok(keys
-        .iter()
-        .rev()
-        .filter_map(|key| {
-            Path::new(key)
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.parse::<Uuid7>().ok())
-        })
-        .next())
+    let parse = |key: &String| {
+        Path::new(key)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<Uuid7>().ok())
+    };
+    let tail = keys.iter().rev().filter_map(parse).next();
+    let Some(first) = keys.iter().find(|key| key.ends_with(".json")) else {
+        return Ok(tail);
+    };
+    let anchor_cursor = match storage
+        .get_json_if_exists::<Event>(Path::new(first))
+        .await?
+    {
+        Some(anchor) => referenced_parent(&anchor)?.map(|(_, cursor)| cursor),
+        None => None,
+    };
+    Ok(tail.max(anchor_cursor))
+}
+
+/// Referenced forks whose anchor names `parent` as their prefix source.
+/// One recursive listing; each conversation's lexically first events key is
+/// its anchor candidate.
+async fn referencing_children(
+    storage: &BasicObjectStore,
+    conversations_dir: &Path,
+    parent: &ConversationId,
+) -> Result<Vec<ConversationId>> {
+    let mut anchors: Vec<(ConversationId, String)> = Vec::new();
+    for key in storage.list_keys(conversations_dir).await? {
+        let relative = match key.split("/conversations/").nth(1) {
+            Some(relative) => relative,
+            None => continue,
+        };
+        let mut parts = relative.split('/');
+        let (Some(conversation), Some("events"), Some(_event)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(conversation) = conversation.parse::<Uuid7>() else {
+            continue;
+        };
+        match anchors.last() {
+            Some((last, _)) if *last == conversation => {}
+            _ => anchors.push((conversation, key)),
+        }
+    }
+    let mut children = Vec::new();
+    for (conversation, anchor_key) in anchors {
+        if conversation == *parent {
+            continue;
+        }
+        let Some(anchor) = storage
+            .get_json_if_exists::<Event>(Path::new(&anchor_key))
+            .await?
+        else {
+            continue;
+        };
+        if let Some((source, _)) = referenced_parent(&anchor)?
+            && source == *parent
+        {
+            children.push(conversation);
+        }
+    }
+    Ok(children)
+}
+
+/// Journal read for a sandbox owner: conversation owners get the composed
+/// journal (a referenced fork's inherited sandbox history lives in its
+/// prefix); agent owners have no fork semantics and read their own dir.
+async fn load_owner_journal(
+    storage: &BasicObjectStore,
+    owner_dir: &Path,
+    conversation: Option<ConversationId>,
+) -> Result<Vec<Event>> {
+    match conversation {
+        Some(id) => Ok(load_journal(
+            storage,
+            owner_dir.parent().expect("conversation dir has a parent"),
+            id,
+        )
+        .await?
+        .events),
+        None => load_events(storage, &owner_dir.join("events")).await,
+    }
+}
+
+/// A journal read with its fork boundary: the composed event sequence and,
+/// for a referenced fork, the cut the boundary-aware folds scope by.
+struct Journal {
+    events: Vec<Event>,
+    fork_boundary: Option<EventId>,
+}
+
+fn referenced_parent(anchor: &Event) -> Result<Option<(ConversationId, EventId)>> {
+    if let EventData::ThreadForked {
+        source_thread_id,
+        up_to_inclusive,
+        representation: Some(ForkRepresentation::Referenced),
+    } = &anchor.data
+    {
+        let Some(cursor) = up_to_inclusive else {
+            bail!(
+                "referenced fork anchor for thread {} lacks a pinned cursor",
+                anchor.thread_id
+            );
+        };
+        return Ok(Some((*source_thread_id, *cursor)));
+    }
+    Ok(None)
+}
+
+/// Resolves a thread's composed journal: for a referenced fork, the parent's
+/// events up to the pinned cursor (recursively — forks nest) followed by the
+/// child's own tail. Prefix ids keep their bytes, which is the point of M4:
+/// a replayer on the child observes the same history its parent observed.
+async fn load_journal(
+    storage: &BasicObjectStore,
+    conversations_dir: &Path,
+    conversation_id: ConversationId,
+) -> Result<Journal> {
+    let events_dir = conversations_dir
+        .join(conversation_id.to_string())
+        .join("events");
+    let own = load_events(storage, &events_dir).await?;
+    let Some((parent, cursor)) = own.first().map(referenced_parent).transpose()?.flatten() else {
+        return Ok(Journal {
+            events: own,
+            fork_boundary: None,
+        });
+    };
+    let mut visited = HashSet::from([conversation_id]);
+    let mut events = Box::pin(load_composed_prefix(
+        storage,
+        conversations_dir,
+        parent,
+        cursor,
+        &mut visited,
+    ))
+    .await?;
+    events.extend(own);
+    Ok(Journal {
+        events,
+        fork_boundary: Some(cursor),
+    })
+}
+
+async fn load_composed_prefix(
+    storage: &BasicObjectStore,
+    conversations_dir: &Path,
+    conversation_id: ConversationId,
+    bound: EventId,
+    visited: &mut HashSet<ConversationId>,
+) -> Result<Vec<Event>> {
+    if !visited.insert(conversation_id) {
+        bail!("fork reference cycle involving thread {conversation_id}");
+    }
+    let events_dir = conversations_dir
+        .join(conversation_id.to_string())
+        .join("events");
+    let mut events = load_events(storage, &events_dir).await?;
+    events.retain(|event| event.id <= bound);
+    let Some((parent, cursor)) = events.first().map(referenced_parent).transpose()?.flatten()
+    else {
+        return Ok(events);
+    };
+    let mut composed = Box::pin(load_composed_prefix(
+        storage,
+        conversations_dir,
+        parent,
+        cursor.min(bound),
+        visited,
+    ))
+    .await?;
+    composed.extend(events);
+    Ok(composed)
 }
 
 /// Mints the next event id strictly above the current tail. The journal's
