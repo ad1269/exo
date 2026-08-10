@@ -8,11 +8,12 @@ use crate::{
     ConversationId, CreateSandboxRequest, Event, EventData, EventId, EventQuery,
     ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult, LeaseState,
     ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
-    OperationRecord, PutSecretRequest, ReadArtifactRequest, ReleaseLeaseRequest, RenewLeaseRequest,
-    SandboxAttachment, SandboxId, SandboxProcessEventQuery, SandboxProcessRecord,
-    SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId, TurnRecord,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    NondeterminismRecord, OperationRecord, PutSecretRequest, ReadArtifactRequest,
+    RecordNondeterminismRequest, ReleaseLeaseRequest, RenewLeaseRequest, SandboxAttachment,
+    SandboxId, SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret,
+    SecretId, SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, ThreadRecord, TurnId, TurnRecord, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,6 +262,11 @@ pub enum Request {
         agent_id: AgentId,
         conversation_id: ConversationId,
     },
+    ConversationRecordNondeterminism {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+        request: RecordNondeterminismRequest,
+    },
     ConversationFork {
         agent_id: AgentId,
         conversation_id: ConversationId,
@@ -381,6 +387,7 @@ impl Request {
             Self::ConversationRenewLease { .. } => "conversation_renew_lease",
             Self::ConversationReleaseLease { .. } => "conversation_release_lease",
             Self::ConversationCurrentLease { .. } => "conversation_current_lease",
+            Self::ConversationRecordNondeterminism { .. } => "conversation_record_nondeterminism",
             Self::ConversationFork { .. } => "conversation_fork",
             Self::ConversationListArtifacts { .. } => "conversation_list_artifacts",
             Self::ConversationReadArtifact { .. } => "conversation_read_artifact",
@@ -442,6 +449,9 @@ pub enum Response {
     },
     CurrentLease {
         lease: Option<LeaseState>,
+    },
+    Nondeterminism {
+        record: NondeterminismRecord,
     },
     SessionId {
         session_id: SessionId,
@@ -517,6 +527,7 @@ impl Response {
             Self::AcquireLease { .. } => "acquire_lease",
             Self::Lease { .. } => "lease",
             Self::CurrentLease { .. } => "current_lease",
+            Self::Nondeterminism { .. } => "nondeterminism",
             Self::SessionId { .. } => "session_id",
             Self::ArtifactVersions { .. } => "artifact_versions",
             Self::Artifact { .. } => "artifact",

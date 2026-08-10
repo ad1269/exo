@@ -40,8 +40,9 @@ use crate::{
     CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
     EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
     GetEventsResult, GetSandboxProcessEventsResult, LeaseId, LeaseState, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, OperationOutcome,
-    OperationRecord, OperationState, PutSecretRequest, ReadArtifactRequest, ReleaseLeaseRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, NondeterminismRecord,
+    OperationOutcome, OperationRecord, OperationState, PutSecretRequest, ReadArtifactRequest,
+    RecordNondeterminismRequest, RecordedValue, RecordedValueKind, ReleaseLeaseRequest,
     RenewLeaseRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
     SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
     SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
@@ -1246,7 +1247,6 @@ impl AgentHandle for BasicAgentHandle {
             None,
             None,
             None,
-            false,
             vec![EventData::ThreadCreated {
                 slug: record.slug.clone(),
                 name: record.name.clone(),
@@ -1293,7 +1293,6 @@ impl AgentHandle for BasicAgentHandle {
                 None,
                 None,
                 record.latest_event_id,
-                false,
                 vec![EventData::ThreadDeleted],
                 &mut record,
             )
@@ -2142,7 +2141,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     None,
                     None,
                     record.latest_event_id,
-                    false,
                     data,
                     &mut record,
                 )
@@ -2174,7 +2172,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     Some(session_id),
                     Some(turn_id),
                     expected_head,
-                    false,
                     data,
                     &mut record,
                 )
@@ -2263,7 +2260,6 @@ impl ConversationHandle for BasicConversationHandle {
             Some(session_id),
             Some(turn_record.id),
             record.latest_event_id,
-            false,
             events_to_append,
             &mut record,
         )
@@ -2614,6 +2610,47 @@ impl ConversationHandle for BasicConversationHandle {
         Ok(fold_lease(&events).filter(|lease| lease.is_live_at(Utc::now())))
     }
 
+    async fn record_nondeterminism(
+        &self,
+        request: RecordNondeterminismRequest,
+    ) -> Result<NondeterminismRecord> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        ensure_current_epoch(
+            fold_lease(&events).as_ref(),
+            request.epoch,
+            Utc::now(),
+            "record_nondeterminism",
+        )?;
+        let value = match request.kind {
+            RecordedValueKind::Time => RecordedValue::Time { at: Utc::now() },
+            RecordedValueKind::Random { len } => {
+                if len as usize > MAX_RECORDED_RANDOM_LEN {
+                    bail!(
+                        "recorded randomness is capped at {MAX_RECORDED_RANDOM_LEN} bytes, not {len}"
+                    );
+                }
+                RecordedValue::Random {
+                    bytes: random_bytes(len as usize),
+                }
+            }
+        };
+        let recording_id = Uuid7::now();
+        let add_result = self
+            .append_kernel_event_locked(EventData::NondeterminismRecorded {
+                recording_id,
+                value: value.clone(),
+                label: request.label.clone(),
+            })
+            .await?;
+        Ok(NondeterminismRecord {
+            recording_id,
+            value,
+            label: request.label,
+            event_id: add_result.latest_event_id,
+        })
+    }
+
     async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let agent = BasicAgentHandle {
@@ -2701,7 +2738,6 @@ impl ConversationHandle for BasicConversationHandle {
             None,
             None,
             fork_record.latest_event_id,
-            false,
             vec![EventData::ThreadForked {
                 source_thread_id: self.record.id,
                 up_to_inclusive: request.up_to_inclusive,
@@ -2734,7 +2770,6 @@ impl ConversationHandle for BasicConversationHandle {
             None,
             None,
             record.latest_event_id,
-            false,
             vec![EventData::ArtifactWritten {
                 artifact_id: artifact_version.artifact_id,
                 path: artifact_version.path.clone(),
@@ -2963,7 +2998,6 @@ impl BasicConversationHandle {
             None,
             None,
             record.latest_event_id,
-            true,
             vec![data],
             &mut record,
         )
@@ -2993,7 +3027,6 @@ impl BasicConversationHandle {
             session_id,
             turn_id,
             expected_head,
-            false,
             data,
             &mut record,
         )
@@ -3511,7 +3544,6 @@ impl TurnHandle for BasicTurnHandle {
             Some(self.record.session_id),
             Some(self.record.id),
             expected_head,
-            false,
             data,
             &mut record,
         )
@@ -3551,7 +3583,6 @@ impl TurnHandle for BasicTurnHandle {
             Some(self.record.session_id),
             Some(self.record.id),
             expected_head,
-            false,
             vec![EventData::ArtifactWritten {
                 artifact_id: artifact_version.artifact_id,
                 path: artifact_version.path.clone(),
@@ -3597,7 +3628,6 @@ impl TurnHandle for BasicTurnHandle {
             Some(self.record.session_id),
             Some(self.record.id),
             expected_head,
-            false,
             vec![EventData::TurnEnded],
             &mut record,
         )
@@ -4063,7 +4093,6 @@ async fn append_sandbox_process_data(
         None,
         None,
         record.latest_event_id,
-        false,
         data,
         &mut record,
     )
@@ -4178,6 +4207,10 @@ fn sandbox_request(
     }
 }
 
+/// Acknowledged append: returns only after every event file is fsynced and
+/// the directory entry for the batch is synced, so "the kernel accepted it"
+/// and "it survives a crash" are the same statement. Event ids are minted
+/// strictly above the journal's current tail — see [`next_event_id`].
 async fn append_events_to_conversation(
     inner: &BasicExoHarnessInner,
     conversation_dir: &Path,
@@ -4185,7 +4218,6 @@ async fn append_events_to_conversation(
     session_id: Option<SessionId>,
     turn_id: Option<TurnId>,
     expected_head: Option<EventId>,
-    durable: bool,
     data: Vec<EventData>,
     record: &mut ConversationRecord,
 ) -> Result<AddEventsResult> {
@@ -4200,10 +4232,15 @@ async fn append_events_to_conversation(
             turn_id,
         )?;
     }
+    let events_dir = conversation_dir.join("events");
+    // The directory scan, not record.json, is the authoritative tail: the
+    // record is a cache that can lag by a crash.
+    let mut head = journal_head(&inner.storage, &events_dir).await?;
     let mut event_ids = Vec::new();
-    let mut latest_event_id = None;
+    let mut pending = Vec::new();
     for data in data {
-        let id = Uuid7::now();
+        let id = next_event_id(head);
+        head = Some(id);
         let event = Event {
             id,
             thread_id: conversation_id,
@@ -4212,23 +4249,64 @@ async fn append_events_to_conversation(
             created_at: id.timestamp().expect("uuid7 timestamp"),
             data,
         };
-        let event_path = conversation_dir
-            .join("events")
-            .join(format!("{}.json", event.id));
-        match durable {
-            true => inner.storage.put_json_durable(event_path, &event).await?,
-            false => inner.storage.put_json(event_path, &event).await?,
-        }
-        notify_subscribers(inner, conversation_id, event.clone());
-        latest_event_id = Some(event.id);
+        inner
+            .storage
+            .put_json_fsync(events_dir.join(format!("{}.json", event.id)), &event)
+            .await?;
         event_ids.push(event.id);
+        pending.push(event);
     }
-    let latest_event_id = latest_event_id.expect("at least one event");
+    // One directory sync covers the whole batch's renames.
+    inner.storage.sync_dir(&events_dir).await?;
+    for event in pending {
+        notify_subscribers(inner, conversation_id, event);
+    }
+    let latest_event_id = *event_ids.last().expect("at least one event");
     record.latest_event_id = Some(latest_event_id);
     Ok(AddEventsResult {
         event_ids,
         latest_event_id,
     })
+}
+
+/// The journal's tail by lexical filename order — uuid ids sort the same as
+/// their bytes, so the last key is the greatest event id.
+async fn journal_head(storage: &BasicObjectStore, events_dir: &Path) -> Result<Option<EventId>> {
+    let keys = storage.list_keys(events_dir).await?;
+    Ok(keys
+        .iter()
+        .rev()
+        .filter_map(|key| {
+            Path::new(key)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<Uuid7>().ok())
+        })
+        .next())
+}
+
+/// Mints the next event id strictly above the current tail. The journal's
+/// promise is total order by id; a wall clock that rolled back across a
+/// restart would otherwise mint ids below history a reader already observed.
+/// When that happens the id is derived from the head instead — order holds,
+/// and the embedded timestamp reads as the prior event's, the honest cost of
+/// a clock that lied. Loud because a bump is evidence of that lie.
+fn next_event_id(head: Option<EventId>) -> EventId {
+    let minted = Uuid7::now();
+    let Some(head) = head else {
+        return minted;
+    };
+    if minted > head {
+        return minted;
+    }
+    let bumped = Uuid7::from(uuid::Uuid::from_u128(head.0.as_u128() + 1));
+    tracing::warn!(
+        %minted,
+        %head,
+        %bumped,
+        "clock rollback detected: minted event id at or below the journal tail; bumping past it"
+    );
+    bumped
 }
 
 /// Kernel-lifecycle kinds are minted only by their own APIs. Rejecting them
@@ -4246,6 +4324,7 @@ fn ensure_appendable_events(data: &[EventData]) -> Result<()> {
                 | EventData::LeaseAcquired { .. }
                 | EventData::LeaseRenewed { .. }
                 | EventData::LeaseReleased { .. }
+                | EventData::NondeterminismRecorded { .. }
                 | EventData::ThreadCreated { .. }
                 | EventData::ThreadUpdated { .. }
                 | EventData::ThreadDeleted
@@ -4288,6 +4367,18 @@ fn ensure_current_epoch(
         (None, None) => Ok(()),
         (None, Some(epoch)) => bail!("{what} carries epoch {epoch} but no lease is live"),
     }
+}
+
+const MAX_RECORDED_RANDOM_LEN: usize = 1024;
+
+/// Same source the secrets store draws from: v4 uuid bytes, 16 at a time.
+fn random_bytes(len: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(len);
+    while bytes.len() < len {
+        bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    bytes.truncate(len);
+    bytes
 }
 
 /// Renew and release act only on the exact lease the caller was granted; a

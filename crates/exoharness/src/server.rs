@@ -356,6 +356,16 @@ impl ExoHarnessServer {
                     lease: conversation.current_lease().await?,
                 })
             }
+            Request::ConversationRecordNondeterminism {
+                agent_id,
+                conversation_id,
+                request,
+            } => {
+                let conversation = self.require_conversation(agent_id, conversation_id).await?;
+                Ok(Response::Nondeterminism {
+                    record: conversation.record_nondeterminism(request).await?,
+                })
+            }
             Request::ConversationFork {
                 agent_id,
                 conversation_id,

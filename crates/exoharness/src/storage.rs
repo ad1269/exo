@@ -32,17 +32,27 @@ impl BasicObjectStore {
 
     /// `put_json` that survives a crash: the object store's local put stages
     /// and renames but never syncs, so this writes directly — temp file,
-    /// `sync_all` (F_FULLFSYNC on macOS), rename, then parent-directory fsync
-    /// so the rename itself is on disk. For records whose existence is a
-    /// promise, like operation intents.
-    pub(crate) async fn put_json_durable<T: Serialize>(
+    /// `sync_all` (F_FULLFSYNC on macOS), rename. The rename itself is on
+    /// disk only after `sync_dir` on the parent; batch writers call that
+    /// once per batch rather than per file.
+    pub(crate) async fn put_json_fsync<T: Serialize>(
         &self,
         key: impl AsRef<Path>,
         value: &T,
     ) -> Result<()> {
         let path = self.root.join(normalize_path(key.as_ref()));
         let bytes = serde_json::to_vec_pretty(value)?;
-        tokio::task::spawn_blocking(move || write_durable(&path, &bytes)).await?
+        tokio::task::spawn_blocking(move || write_fsync(&path, &bytes)).await?
+    }
+
+    pub(crate) async fn sync_dir(&self, key: impl AsRef<Path>) -> Result<()> {
+        let path = self.root.join(normalize_path(key.as_ref()));
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&path)?
+                .sync_all()
+                .with_context(|| format!("failed to sync directory {}", path.display()))
+        })
+        .await?
     }
 
     pub(crate) async fn put_json<T: Serialize>(
@@ -182,7 +192,7 @@ impl BasicObjectStore {
     }
 }
 
-fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_fsync(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let parent = path
@@ -202,9 +212,6 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(file);
     std::fs::rename(&temporary, path)
         .with_context(|| format!("failed to rename into {}", path.display()))?;
-    std::fs::File::open(parent)?
-        .sync_all()
-        .with_context(|| format!("failed to sync directory {}", parent.display()))?;
     Ok(())
 }
 

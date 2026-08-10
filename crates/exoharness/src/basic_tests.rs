@@ -19,18 +19,19 @@ use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
-    AcquireLeaseRequest, Artifact, ArtifactVersion, BasicExoHarness, BeginOperationRequest,
-    BeginTurnRequest, Binding, BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest,
-    CompleteOperationRequest, CreateSandboxRequest, DurableFileSystem, EventData, EventKind,
-    EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode, ForkConversationRequest,
-    ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
-    OperationOutcome, OperationState, PutSecretRequest, RecoveryBudget, RecoveryPolicy,
-    RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
-    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
-    Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    AcquireLeaseRequest, AddEventsRequest, Artifact, ArtifactVersion, BasicExoHarness,
+    BeginOperationRequest, BeginTurnRequest, Binding, BoxAsyncRead, BoxAsyncWrite,
+    CloseSandboxProcessInputRequest, CompleteOperationRequest, CreateSandboxRequest,
+    DurableFileSystem, Event, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    FileSystemMountMode, ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle,
+    NewAgentRequest, NewConversationRequest, OperationOutcome, OperationState, PutSecretRequest,
+    RecoveryBudget, RecoveryPolicy, RunInSandboxRequest, SandboxAttachment,
+    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
+    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
+    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind, SnapshotPayload,
+    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -315,6 +316,203 @@ async fn basic_backend_leases_survive_restart() {
         .await
         .expect("fenced begin after restart");
     assert!(fenced.created);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_journal_reads_are_replayable() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path()))
+            .await
+            .expect("harness should initialize"),
+    );
+    crate::contract_tests::journal_reads_are_replayable_and_recordings_ride_the_log(harness).await;
+}
+
+// The replay contract across a crash: a cursor taken before the restart
+// continues the identical sequence after it.
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_cursors_stay_valid_across_restart() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let agent_id = agent.record().id;
+    let conversation_id = conversation.record().id;
+    for i in 0..6 {
+        conversation
+            .add_events(AddEventsRequest {
+                session_id: None,
+                turn_id: None,
+                data: vec![EventData::Custom {
+                    event_type: "tick".to_string(),
+                    payload: serde_json::json!({ "i": i }),
+                }],
+            })
+            .await
+            .expect("append");
+    }
+    let full = conversation
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("full read")
+        .events;
+    let first_pages = conversation
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            limit: Some(3),
+            ..Default::default()
+        }))
+        .await
+        .expect("first pages");
+    drop(conversation);
+    drop(agent);
+    drop(harness);
+
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should reopen");
+    let conversation = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup")
+        .expect("agent survives restart")
+        .get_conversation(&conversation_id)
+        .await
+        .expect("conversation lookup")
+        .expect("conversation survives restart");
+    let continued = conversation
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            cursor: first_pages.cursor,
+            ..Default::default()
+        }))
+        .await
+        .expect("continued read")
+        .events;
+    let mut replayed = first_pages.events;
+    replayed.extend(continued);
+    assert_eq!(
+        replayed.iter().map(|event| event.id).collect::<Vec<_>>(),
+        full.iter().map(|event| event.id).collect::<Vec<_>>(),
+        "a pre-restart cursor continues the identical sequence"
+    );
+}
+
+// The rollback simulation: an event planted with a FUTURE timestamp stands
+// in for history minted before a clock rollback. Appends must land after
+// it — order is the promise, not timestamp fidelity.
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_a_rolled_back_clock_cannot_reorder_the_journal() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let created = conversation
+        .get_events(None)
+        .await
+        .expect("events")
+        .events
+        .pop()
+        .expect("thread created event");
+
+    // Plant a journal entry ten minutes in the future, as a pre-rollback
+    // process would have left it.
+    let future = chrono::Utc::now() + chrono::Duration::minutes(10);
+    let future_id = crate::Uuid7::from(uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        future.timestamp() as u64,
+        future.timestamp_subsec_nanos(),
+    )));
+    let events_dir = find_events_dir(tempdir.path(), &created.id.to_string());
+    let planted = Event {
+        id: future_id,
+        thread_id: conversation.record().id,
+        session_id: None,
+        turn_id: None,
+        created_at: future,
+        data: EventData::Custom {
+            event_type: "planted-future".to_string(),
+            payload: serde_json::Value::Null,
+        },
+    };
+    std::fs::write(
+        events_dir.join(format!("{future_id}.json")),
+        serde_json::to_vec_pretty(&planted).expect("serialize planted event"),
+    )
+    .expect("plant future event");
+
+    let appended = conversation
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::Custom {
+                event_type: "after-rollback".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+        })
+        .await
+        .expect("append after rollback");
+    assert!(
+        appended.latest_event_id > future_id,
+        "the bump mints past the planted future id"
+    );
+    let events = conversation
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("read")
+        .events;
+    assert!(events.windows(2).all(|pair| pair[0].id < pair[1].id));
+    assert_eq!(events.last().expect("last").id, appended.latest_event_id);
+}
+
+fn find_events_dir(root: &std::path::Path, known_event_file: &str) -> std::path::PathBuf {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) == Some("events")
+                    && path.join(format!("{known_event_file}.json")).exists()
+                {
+                    return path;
+                }
+                stack.push(path);
+            }
+        }
+    }
+    panic!("events directory not found under {}", root.display());
 }
 
 #[tokio::test(flavor = "current_thread")]

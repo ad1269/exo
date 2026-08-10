@@ -791,6 +791,13 @@ impl ConversationHandle for LocalSandboxConversation {
         self.remote.current_lease().await
     }
 
+    async fn record_nondeterminism(
+        &self,
+        request: exoharness::RecordNondeterminismRequest,
+    ) -> Result<exoharness::NondeterminismRecord> {
+        self.remote.record_nondeterminism(request).await
+    }
+
     async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
         let remote = self.remote.fork(request).await?;
         Ok(wrap_conversation(Arc::clone(&self.state), remote))

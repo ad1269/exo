@@ -13,8 +13,9 @@ use crate::{
     CompleteOperationRequest, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
     ForkConversationRequest, ListConversationsRequest, ListThreadsRequest, ManagedSandboxBackend,
     ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, NewThreadRequest,
-    OperationOutcome, OperationState, RecoveryBudget, RecoveryPolicy, ReleaseLeaseRequest,
-    RenewLeaseRequest, SandboxCommand, SandboxRequest, ThreadHandle, Uuid7, WriteArtifactRequest,
+    OperationOutcome, OperationState, RecordNondeterminismRequest, RecordedValue,
+    RecordedValueKind, RecoveryBudget, RecoveryPolicy, ReleaseLeaseRequest, RenewLeaseRequest,
+    SandboxCommand, SandboxRequest, ThreadHandle, Uuid7, WriteArtifactRequest,
 };
 
 pub async fn supports_thread_api_and_conversation_compatibility(harness: Arc<dyn ExoHarness>) {
@@ -984,6 +985,233 @@ pub async fn turn_leases_enforce_single_writer_with_epoch_fencing(harness: Arc<d
             .await
             .is_err()
     );
+}
+
+pub async fn journal_reads_are_replayable_and_recordings_ride_the_log(
+    harness: Arc<dyn ExoHarness>,
+) {
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: unique_slug("agent"),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+
+    // A mixed-kind log: producer appends, an operation, recordings.
+    for i in 0..3 {
+        conversation
+            .add_events(AddEventsRequest {
+                session_id: None,
+                turn_id: None,
+                data: vec![
+                    EventData::Custom {
+                        event_type: "tick".to_string(),
+                        payload: serde_json::json!({ "i": i }),
+                    },
+                    user_event(&format!("message {i}")),
+                ],
+            })
+            .await
+            .expect("append");
+    }
+    let operation = conversation
+        .begin_operation(BeginOperationRequest {
+            effect_kind: "adapter.send".to_string(),
+            idempotency_key: "order-1".to_string(),
+            recovery_policy: RecoveryPolicy::Retry,
+            budget: RecoveryBudget::default(),
+            epoch: None,
+        })
+        .await
+        .expect("operation");
+    let time = conversation
+        .record_nondeterminism(RecordNondeterminismRequest {
+            kind: RecordedValueKind::Time,
+            label: Some("started-at".to_string()),
+            epoch: None,
+        })
+        .await
+        .expect("recorded time");
+    let random = conversation
+        .record_nondeterminism(RecordNondeterminismRequest {
+            kind: RecordedValueKind::Random { len: 32 },
+            label: None,
+            epoch: None,
+        })
+        .await
+        .expect("recorded randomness");
+    let RecordedValue::Random { bytes } = &random.value else {
+        panic!("random recording should carry bytes");
+    };
+    assert_eq!(bytes.len(), 32);
+    assert!(matches!(time.value, RecordedValue::Time { .. }));
+
+    // The promise: ascending reads are the total order, strictly by id.
+    let full = conversation
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("full read")
+        .events;
+    assert!(
+        full.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "ascending reads deliver strictly increasing ids"
+    );
+
+    // Cursor pagination replays the identical sequence, and re-reading from
+    // any cursor is stable.
+    let mut paged = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = conversation
+            .get_events(Some(EventQuery {
+                direction: Some(EventQueryDirection::Asc),
+                cursor,
+                limit: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .expect("page");
+        if page.events.is_empty() {
+            break;
+        }
+        let replayed = conversation
+            .get_events(Some(EventQuery {
+                direction: Some(EventQueryDirection::Asc),
+                cursor,
+                limit: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .expect("replayed page");
+        assert_eq!(
+            page.events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            replayed
+                .events
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            "re-reading from the same cursor returns the same page"
+        );
+        cursor = page.cursor;
+        paged.extend(page.events);
+    }
+    assert_eq!(
+        paged.iter().map(|event| event.id).collect::<Vec<_>>(),
+        full.iter().map(|event| event.id).collect::<Vec<_>>(),
+        "pagination replays the exact total order"
+    );
+
+    // The journal is the recording: reading it back yields the served
+    // values, in the order they were served.
+    let recordings = conversation
+        .get_events(Some(EventQuery {
+            types: Some(vec![EventKind::NONDETERMINISM_RECORDED]),
+            ..Default::default()
+        }))
+        .await
+        .expect("recordings")
+        .events;
+    assert_eq!(recordings.len(), 2);
+    let EventData::NondeterminismRecorded {
+        recording_id,
+        value,
+        label,
+    } = &recordings[0].data
+    else {
+        panic!("first recording event");
+    };
+    assert_eq!(*recording_id, time.recording_id);
+    assert_eq!(*value, time.value);
+    assert_eq!(label.as_deref(), Some("started-at"));
+    let EventData::NondeterminismRecorded { value, .. } = &recordings[1].data else {
+        panic!("second recording event");
+    };
+    assert_eq!(*value, random.value);
+
+    // Kernel-served means kernel-bounded and kernel-minted.
+    assert!(
+        conversation
+            .record_nondeterminism(RecordNondeterminismRequest {
+                kind: RecordedValueKind::Random { len: 4096 },
+                label: None,
+                epoch: None,
+            })
+            .await
+            .is_err(),
+        "recorded randomness is capped"
+    );
+    assert!(
+        conversation
+            .add_events(AddEventsRequest {
+                session_id: None,
+                turn_id: None,
+                data: vec![EventData::NondeterminismRecorded {
+                    recording_id: Uuid7::now(),
+                    value: RecordedValue::Time {
+                        at: chrono::Utc::now()
+                    },
+                    label: None,
+                }],
+            })
+            .await
+            .is_err(),
+        "recordings cannot be forged through the producer path"
+    );
+
+    // Recording is a commit: fenced like any other authority-gated write.
+    let leased = conversation
+        .acquire_lease(AcquireLeaseRequest {
+            holder: "activation-m1".to_string(),
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("lease");
+    assert!(
+        conversation
+            .record_nondeterminism(RecordNondeterminismRequest {
+                kind: RecordedValueKind::Time,
+                label: None,
+                epoch: None,
+            })
+            .await
+            .is_err(),
+        "an unfenced recording under a live lease is a zombie write"
+    );
+    let fenced = conversation
+        .record_nondeterminism(RecordNondeterminismRequest {
+            kind: RecordedValueKind::Time,
+            label: None,
+            epoch: Some(leased.lease.epoch),
+        })
+        .await
+        .expect("fenced recording");
+    assert!(matches!(fenced.value, RecordedValue::Time { .. }));
+    // Anchor the earlier operation so the log ends settled.
+    conversation
+        .complete_operation(CompleteOperationRequest {
+            operation_id: operation.operation.operation_id,
+            outcome: OperationOutcome::Succeeded,
+            detail: None,
+            epoch: Some(leased.lease.epoch),
+        })
+        .await
+        .expect("settle");
+}
+
+fn user_event(text: &str) -> EventData {
+    EventData::Messages {
+        messages: vec![user_message(text)],
+        response_id: None,
+        usage: None,
+    }
 }
 
 pub async fn conversation_scope_overrides_agent_scope_and_fork_copies_bindings(

@@ -24,13 +24,13 @@ use crate::{
     ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
     EventId, EventQuery, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
     GetSandboxProcessEventsResult, LeaseState, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, OperationRecord, PutSecretRequest,
-    ReadArtifactRequest, ReleaseLeaseRequest, RenewLeaseRequest, Result, RunInSandboxRequest,
-    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
-    WriteSandboxProcessInputRequest,
+    NewAgentRequest, NewConversationRequest, NondeterminismRecord, OperationRecord,
+    PutSecretRequest, ReadArtifactRequest, RecordNondeterminismRequest, ReleaseLeaseRequest,
+    RenewLeaseRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Clone)]
@@ -980,6 +980,24 @@ impl ConversationHandle for HttpConversationHandle {
         {
             Response::CurrentLease { lease } => Ok(lease),
             response => unexpected_response(response, "current_lease"),
+        }
+    }
+
+    async fn record_nondeterminism(
+        &self,
+        request: RecordNondeterminismRequest,
+    ) -> Result<NondeterminismRecord> {
+        match self
+            .harness
+            .request(Request::ConversationRecordNondeterminism {
+                agent_id: self.agent_id,
+                conversation_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::Nondeterminism { record } => Ok(record),
+            response => unexpected_response(response, "nondeterminism"),
         }
     }
 

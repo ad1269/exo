@@ -124,6 +124,15 @@ async fn http_exoharness_turn_leases_enforce_single_writer_with_epoch_fencing() 
 }
 
 #[actix_web::test]
+async fn http_exoharness_journal_reads_are_replayable() {
+    let fixture = http_harness().await;
+    crate::contract_tests::journal_reads_are_replayable_and_recordings_ride_the_log(Arc::clone(
+        &fixture.harness,
+    ))
+    .await;
+}
+
+#[actix_web::test]
 async fn http_exoharness_conversation_scope_overrides_and_forks() {
     let fixture = http_harness().await;
     crate::contract_tests::conversation_scope_overrides_agent_scope_and_fork_copies_bindings(

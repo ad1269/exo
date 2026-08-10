@@ -1078,6 +1078,13 @@ impl ConversationHandle for FakeConversationHandle {
         Ok(None)
     }
 
+    async fn record_nondeterminism(
+        &self,
+        _request: exoharness::RecordNondeterminismRequest,
+    ) -> Result<exoharness::NondeterminismRecord> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn fork(&self, _request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
         Err(anyhow!("not implemented"))
     }

@@ -132,6 +132,11 @@ pub trait ThreadHandle: SandboxHandle {
     /// this method only bundles those ids back into the trait object API.
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>>;
 
+    /// The replayable read. Ascending reads deliver events in the journal's
+    /// promised total order (see [`Event::id`]); `cursor` resumes strictly
+    /// after a previously returned id and remains valid across restarts and
+    /// reopened handles — a crashed reader re-reading from its cursor
+    /// observes identical events in identical order.
     async fn get_events(&self, query: Option<EventQuery>) -> Result<GetEventsResult>;
     async fn watch_events(&self, after_exclusive: Bound<EventId>) -> Result<EventStream>;
     async fn get_event(&self, id: EventId) -> Result<Option<Event>>;
@@ -173,6 +178,14 @@ pub trait ThreadHandle: SandboxHandle {
     /// The live lease, if any. Liveness is judged against the kernel clock
     /// at read time — expiry is not an event.
     async fn current_lease(&self) -> Result<Option<LeaseState>>;
+
+    /// Mints a kernel-served nondeterministic value (time or randomness),
+    /// journals it durably, and returns it. Replay reads the journal instead
+    /// of calling again — the recording and the history are the same log.
+    async fn record_nondeterminism(
+        &self,
+        request: RecordNondeterminismRequest,
+    ) -> Result<NondeterminismRecord>;
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
@@ -348,6 +361,8 @@ impl EventKind {
     pub const LEASE_ACQUIRED: EventKind = EventKind(Cow::Borrowed("lease_acquired"));
     pub const LEASE_RENEWED: EventKind = EventKind(Cow::Borrowed("lease_renewed"));
     pub const LEASE_RELEASED: EventKind = EventKind(Cow::Borrowed("lease_released"));
+    pub const NONDETERMINISM_RECORDED: EventKind =
+        EventKind(Cow::Borrowed("nondeterminism_recorded"));
 
     pub fn custom(name: impl Into<Cow<'static, str>>) -> Self {
         Self(name.into())
@@ -435,6 +450,16 @@ pub struct UsageRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    /// Position in the thread's total order. The journal PROMISES: ids are
+    /// unique, lexical uuid byte order is the append order, and the order
+    /// never changes across restarts — the kernel mints every id strictly
+    /// above the journal tail, bumping past it when a rolled-back clock
+    /// would say otherwise. Embedded timestamps are informational; under a
+    /// clock rollback a bumped id inherits a near-tail timestamp, which can
+    /// make a lease's apparent liveness outlast its real-time TTL by at
+    /// most the rollback magnitude — an availability delay on re-acquire,
+    /// never a safety violation (epochs fence regardless, and apparent
+    /// liveness never shortens).
     pub id: EventId,
     #[serde(alias = "conversation_id")]
     pub thread_id: ThreadId,
@@ -605,6 +630,12 @@ pub enum EventData {
         lease_id: LeaseId,
         epoch: u64,
     },
+    NondeterminismRecorded {
+        recording_id: RecordingId,
+        value: RecordedValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     Custom {
         event_type: String,
         payload: Value,
@@ -644,6 +675,7 @@ impl EventData {
             Self::LeaseAcquired { .. } => EventKind::LEASE_ACQUIRED,
             Self::LeaseRenewed { .. } => EventKind::LEASE_RENEWED,
             Self::LeaseReleased { .. } => EventKind::LEASE_RELEASED,
+            Self::NondeterminismRecorded { .. } => EventKind::NONDETERMINISM_RECORDED,
             Self::Custom { event_type, .. } => EventKind::custom(event_type.clone()),
         }
     }
@@ -824,6 +856,49 @@ pub struct AcquireLeaseResult {
     /// or its own live lease returned idempotently. False means another
     /// holder is live; back off.
     pub acquired: bool,
+}
+
+pub type RecordingId = Uuid7;
+
+/// A recorded nondeterministic value. The journal is the recording: replay
+/// consumes these events in order instead of re-asking the world, which is
+/// what lets an orchestration function be deterministic without heroics.
+/// Kernel-served time and randomness only — arbitrary record-and-return
+/// memoization is deliberately out of scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordedValue {
+    Time { at: DateTimeUtc },
+    Random { bytes: Vec<u8> },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordedValueKind {
+    Time,
+    Random { len: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordNondeterminismRequest {
+    pub kind: RecordedValueKind,
+    /// Zero semantics: a debugging and audit aid for when a replay
+    /// mismatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Fencing token, same rule as `BeginOperationRequest::epoch` — a
+    /// recording is a commit by the executing activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NondeterminismRecord {
+    pub recording_id: RecordingId,
+    pub value: RecordedValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub event_id: EventId,
 }
 
 /// Replays lease events to the latest lease, in event order. Expiry is not
