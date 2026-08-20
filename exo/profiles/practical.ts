@@ -6,6 +6,7 @@ import {
 } from "@exo/harness";
 
 import { registerGuardianTools } from "../tools/guardian-tools";
+import { registerInputTools } from "../tools/input-tools";
 import { registerIntrospectionTools } from "../tools/introspection-tools";
 import { registerMemoryTools } from "../tools/memory-tools";
 import { registerSandboxTools } from "../tools/sandbox-tools";
@@ -29,6 +30,7 @@ export const practicalProfile: ExoProfile = {
     registerAdapterTools(libraryTools);
     registerIntrospectionTools(libraryTools);
     registerSandboxTools(libraryTools);
+    registerInputTools(libraryTools);
     registerMemoryTools(libraryTools);
     registerTodoTools(libraryTools);
     registerSkillTools(libraryTools);

@@ -1,5 +1,6 @@
 mod adapter;
 mod agent_sandbox;
+mod attention;
 mod basic;
 #[cfg(test)]
 mod basic_tests;
@@ -22,6 +23,7 @@ mod harness_js_repl;
 mod harness_runtime;
 mod harness_tool;
 mod harness_types;
+mod input_requests;
 mod local_sandbox;
 mod rlm;
 #[cfg(test)]
@@ -40,6 +42,9 @@ pub use adapter::{
     AdapterRecord, AdapterSource, NewAdapter, WorkerSecretEnvVar,
 };
 pub use adapter::{AdapterRunOptions, run_adapters_watch};
+pub use attention::{
+    AttentionOptions, EXO_INPUT_REQUEST_NUDGED_EVENT, InputRequestNudge, run_attention_pass,
+};
 pub use braintrust::{BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig};
 pub use conversation_events::{
     HOST_EVENT_ADAPTER_RUNNER_DRAINING, HOST_EVENT_ADAPTER_RUNNER_STARTED, HOST_EVENT_REBOOT,
@@ -55,7 +60,7 @@ pub use executor_types::{
 };
 pub use exoharness::{
     AgentHandle, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, Binding,
-    BindingRecord, ConversationHandle, CreateSandboxRequest, DEFAULT_SANDBOX_IMAGE,
+    BindingRecord, ConversationHandle, CreateSandboxRequest, DEFAULT_SANDBOX_IMAGE, DateTimeUtc,
     DaytonaBackendSpec, DurableFileSystem, E2bBackendSpec, EventData, EventId, EventKind,
     EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, FileSystemMount,
     FileSystemMountMode, FirecrackerBackendSpec, ForkConversationRequest,
@@ -81,6 +86,11 @@ pub use harness_config::load_agent_config;
 pub use harness_tool::{BasicToolRuntime, ExoToolRuntime};
 pub use harness_types::{
     CreateAgentRequest, CreateConversationRequest, Harness, HarnessAgent, HarnessConversation,
+};
+pub use input_requests::{
+    INPUT_REQUESTED_EVENT, INPUT_RESOLVED_EVENT, InputRequestKind, InputRequestedPayload,
+    InputResolution, InputResolvedPayload, PendingInputRequest, match_pending_adapter_request,
+    pending_input_requests, record_input_resolved, resolve_pending_adapter_input_request,
 };
 pub use local_sandbox::LocalSandboxExoHarness;
 pub use rlm::RlmHarness;

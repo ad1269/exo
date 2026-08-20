@@ -8,9 +8,10 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use executor::{
-    BasicExoHarnessConfig, BraintrustRuntimeConfig, ExoToolRuntime, Harness,
-    SandboxBackendRegistration, SandboxProvider, SchedulerRunOptions, SchedulerStore,
-    SecretBackendChoice, TypeScriptHarness, redeliver_pending_wakes, run_due_tasks,
+    AdapterStore, AttentionOptions, BasicExoHarnessConfig, BraintrustRuntimeConfig, ExoToolRuntime,
+    Harness, SandboxBackendRegistration, SandboxProvider, SchedulerRunOptions, SchedulerStore,
+    SecretBackendChoice, TypeScriptHarness, redeliver_pending_wakes, run_attention_pass,
+    run_due_tasks,
 };
 
 #[derive(Debug, Parser)]
@@ -65,6 +66,7 @@ async fn main() -> Result<()> {
         } => {
             let _lock = SchedulerRunnerLock::acquire(&cli.root)?;
             let store = SchedulerStore::new(cli.root.join("scheduled-tasks"));
+            let adapter_store = AdapterStore::new(cli.root.join("adapters"));
             // A previous runner may have died between finishing a task and
             // waking its conversation. Settle that before taking new work.
             let redelivered = redeliver_pending_wakes(Arc::clone(&harness), &store).await?;
@@ -72,6 +74,29 @@ async fn main() -> Result<()> {
                 println!("redelivered {redelivered} pending conversation wakeup(s)");
             }
             loop {
+                // Attention pass (v0): re-nudge aged pending input requests
+                // before running due tasks. A failed pass must not stop the
+                // scheduler.
+                match run_attention_pass(
+                    harness.as_ref(),
+                    &adapter_store,
+                    &AttentionOptions::default(),
+                )
+                .await
+                {
+                    Ok(nudges) => {
+                        for nudge in nudges {
+                            println!(
+                                "nudged input request {} on {}/{} (age {}s)",
+                                nudge.request_id,
+                                nudge.agent_slug,
+                                nudge.conversation_slug,
+                                nudge.age_seconds
+                            );
+                        }
+                    }
+                    Err(error) => eprintln!("attention pass failed: {error}"),
+                }
                 let runs =
                     run_due_tasks(Arc::clone(&harness), &store, SchedulerRunOptions { limit })
                         .await?;
