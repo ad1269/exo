@@ -22,6 +22,7 @@ mod harness_js_repl;
 mod harness_runtime;
 mod harness_tool;
 mod harness_types;
+mod input_requests;
 mod local_sandbox;
 mod rlm;
 #[cfg(test)]
@@ -81,6 +82,11 @@ pub use harness_config::load_agent_config;
 pub use harness_tool::{BasicToolRuntime, ExoToolRuntime};
 pub use harness_types::{
     CreateAgentRequest, CreateConversationRequest, Harness, HarnessAgent, HarnessConversation,
+};
+pub use input_requests::{
+    INPUT_REQUESTED_EVENT, INPUT_RESOLVED_EVENT, InputRequestKind, InputRequestedPayload,
+    InputResolution, InputResolvedPayload, PendingInputRequest, match_pending_adapter_request,
+    pending_input_requests, record_input_resolved, resolve_pending_adapter_input_request,
 };
 pub use local_sandbox::LocalSandboxExoHarness;
 pub use rlm::RlmHarness;

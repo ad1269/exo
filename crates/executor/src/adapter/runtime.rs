@@ -25,6 +25,7 @@ use crate::conversation_events::{
     record_host_event,
 };
 use crate::conversation_wakeup::{send_conversation_wakeup, send_conversation_wakeup_content};
+use crate::input_requests::resolve_pending_adapter_input_request;
 use crate::{CreateConversationRequest, Harness, HarnessAgent, HarnessConversation};
 
 const INITIAL_RESTART_DELAY: Duration = Duration::from_secs(5);
@@ -808,6 +809,46 @@ async fn handle_worker_message(
             ),
         )
         .await?;
+    // Input-request convention, Discord reference integration: when a
+    // pending `input_requested` on this conversation was relayed through
+    // this adapter (and target, when pinned), the reply settles it as
+    // `input_resolved` instead of starting a wakeup turn — the turn that
+    // asked is blocked in `request_input` and consumes the answer from the
+    // event log. Errors fall through to the normal wakeup so the message is
+    // never lost.
+    if config.adapter_type == "discord" {
+        match resolve_pending_adapter_input_request(
+            conversation.exoharness_handle().as_ref(),
+            &adapter.id,
+            &target,
+            sender.as_deref(),
+            &text,
+        )
+        .await
+        {
+            Ok(Some(request)) => {
+                store
+                    .record_event(
+                        adapter.id.clone(),
+                        AdapterEventType::Inbound,
+                        format!(
+                            "resolved input request {} from reply at {}",
+                            request.payload.request_id, target
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    adapter_id = %adapter.id,
+                    %error,
+                    "failed to check pending input requests; delivering as wakeup"
+                );
+            }
+        }
+    }
     let image_parts = download_inbound_images(&adapter.id, store, &attachments).await;
     let prompt = compose_inbound_wakeup_prompt(
         config,
