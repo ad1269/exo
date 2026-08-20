@@ -51,6 +51,15 @@ pub async fn run_due_tasks(
     let due = store
         .claim_due_tasks(now_ms(), options.limit, DEFAULT_TASK_LEASE_MS)
         .await?;
+    // Attention ordering (v0): tasks whose conversation has an aged pending
+    // input request are started first, so blocked conversations surface
+    // before routine work.
+    let due = crate::attention::order_due_tasks_for_attention(
+        harness.as_ref(),
+        due,
+        crate::attention::AttentionOptions::default().nudge_after,
+    )
+    .await;
     let runs = futures::future::try_join_all(
         due.into_iter()
             .map(|task| run_task(Arc::clone(&harness), store, task)),

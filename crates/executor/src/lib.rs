@@ -1,5 +1,6 @@
 mod adapter;
 mod agent_sandbox;
+mod attention;
 mod basic;
 #[cfg(test)]
 mod basic_tests;
@@ -41,6 +42,9 @@ pub use adapter::{
     AdapterRecord, AdapterSource, NewAdapter, WorkerSecretEnvVar,
 };
 pub use adapter::{AdapterRunOptions, run_adapters_watch};
+pub use attention::{
+    AttentionOptions, EXO_INPUT_REQUEST_NUDGED_EVENT, InputRequestNudge, run_attention_pass,
+};
 pub use braintrust::{BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig};
 pub use conversation_events::{
     HOST_EVENT_ADAPTER_RUNNER_DRAINING, HOST_EVENT_ADAPTER_RUNNER_STARTED, HOST_EVENT_REBOOT,
