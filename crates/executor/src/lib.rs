@@ -56,7 +56,7 @@ pub use executor_types::{
 };
 pub use exoharness::{
     AgentHandle, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, Binding,
-    BindingRecord, ConversationHandle, CreateSandboxRequest, DEFAULT_SANDBOX_IMAGE,
+    BindingRecord, ConversationHandle, CreateSandboxRequest, DEFAULT_SANDBOX_IMAGE, DateTimeUtc,
     DaytonaBackendSpec, DurableFileSystem, E2bBackendSpec, EventData, EventId, EventKind,
     EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, FileSystemMount,
     FileSystemMountMode, FirecrackerBackendSpec, ForkConversationRequest,

@@ -43,8 +43,9 @@ use executor::{
     SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
     Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
     default_docker_image, default_e2b_template, default_firecracker_image, default_vercel_image,
-    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config,
+    pending_input_requests, record_host_event, send_conversation_wakeup,
+    serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -746,6 +747,11 @@ enum AgentMountCommands {
 #[derive(Debug, Subcommand)]
 enum ConversationCommands {
     List {
+        agent: String,
+    },
+    /// List conversations blocked on a pending input request
+    /// (input_requested without a matching input_resolved).
+    Blocked {
         agent: String,
     },
     Create {
@@ -1816,6 +1822,37 @@ async fn main() -> Result<()> {
                             ]
                         })
                         .collect(),
+                )?;
+            }
+            ConversationCommands::Blocked { agent } => {
+                let agent = must_get_agent(harness.as_ref(), &agent).await?;
+                let mut rows = Vec::new();
+                for record in agent.list_conversations().await? {
+                    let Some(conversation) = agent.get_conversation(&record.id.to_string()).await?
+                    else {
+                        continue;
+                    };
+                    for pending in
+                        pending_input_requests(conversation.exoharness_handle().as_ref()).await?
+                    {
+                        rows.push((
+                            pending.requested_at,
+                            vec![
+                                record.slug.clone(),
+                                pending.payload.request_id.clone(),
+                                pending.payload.kind.as_str().to_string(),
+                                format_request_age(pending.requested_at),
+                                truncate_prompt(&pending.payload.prompt),
+                            ],
+                        ));
+                    }
+                }
+                // Oldest first across conversations: the longest-waiting
+                // human is the one to deal with.
+                rows.sort_by_key(|(requested_at, _)| *requested_at);
+                print_table(
+                    &["CONVERSATION", "REQUEST", "KIND", "AGE", "PROMPT"],
+                    rows.into_iter().map(|(_, row)| row).collect(),
                 )?;
             }
             ConversationCommands::Create {
@@ -2912,6 +2949,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         },
         Commands::Conversation { command } => match command {
             ConversationCommands::List { agent }
+            | ConversationCommands::Blocked { agent }
             | ConversationCommands::Create { agent, .. }
             | ConversationCommands::Fork { agent, .. }
             | ConversationCommands::Update { agent, .. }
@@ -3309,6 +3347,31 @@ fn print_table(headers: &[&str], rows: Vec<Vec<String>>) -> Result<()> {
     }
     writer.flush()?;
     Ok(())
+}
+
+fn format_request_age(requested_at: executor::DateTimeUtc) -> String {
+    let requested: std::time::SystemTime = requested_at.into();
+    let seconds = std::time::SystemTime::now()
+        .duration_since(requested)
+        .unwrap_or_default()
+        .as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86400 => format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60),
+        _ => format!("{}d{}h", seconds / 86400, (seconds % 86400) / 3600),
+    }
+}
+
+fn truncate_prompt(prompt: &str) -> String {
+    const MAX_PROMPT_CHARS: usize = 60;
+    let flattened = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= MAX_PROMPT_CHARS {
+        flattened
+    } else {
+        let truncated: String = flattened.chars().take(MAX_PROMPT_CHARS).collect();
+        format!("{truncated}…")
+    }
 }
 
 fn write_table_row<T: AsRef<str>, W: Write>(writer: &mut W, values: &[T]) -> io::Result<()> {
