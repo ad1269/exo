@@ -63,6 +63,7 @@ export default defineConfig({
           { text: "Executors & Harnesses", link: "/concepts/executors" },
           { text: "Tools", link: "/concepts/tools" },
           { text: "Adapters", link: "/concepts/adapters" },
+          { text: "Input Requests", link: "/concepts/input-requests" },
           { text: "Task Scheduler", link: "/concepts/task-scheduler" },
           { text: "The Canonical Agent", link: "/concepts/canonical-agent" },
         ],

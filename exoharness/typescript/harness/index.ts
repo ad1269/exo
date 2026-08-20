@@ -8,6 +8,7 @@ export interface JsonObject {
 
 export * from "./tools";
 export * from "./built-in-tools";
+export * from "./input-requests";
 export * from "./tool-modules";
 export * from "./adapter-tools";
 export * from "./skill-tools";
