@@ -428,6 +428,11 @@ export type HostToGuestMessage =
   | { kind: "runtime_event"; event: RawRuntimeEvent };
 
 export type GuestToHostMessage =
+  | {
+      kind: "capabilities";
+      resume_turn: boolean;
+      reconcile_unresolved_tool_calls: boolean;
+    }
   | { kind: "runtime_request"; id: number; request: RawRuntimeRequest }
   | { kind: "exo_request"; id: number; request: RawExoRequest }
   | { kind: "stream_event"; event: RawTypeScriptStreamEvent }

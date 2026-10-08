@@ -429,8 +429,16 @@ export interface TurnContext {
 export interface TypeScriptHarness {
   tools?: ToolModuleExport;
   nativeToolApprovals?: boolean;
+  /**
+   * Resume can reconcile tool calls that never got a result. Declared to the
+   * host at startup; with `resumeTurn`, lets a turn suspend mid-tool-call.
+   */
   reconcileUnresolvedToolCalls?: boolean;
   runTurn(context: TurnContext): Promise<void>;
+  /**
+   * Continues an unfinished turn after suspension or restart. Declared to the
+   * host at startup; without it, the host refuses to suspend this harness.
+   */
   resumeTurn?(context: TurnContext): Promise<void>;
 }
 

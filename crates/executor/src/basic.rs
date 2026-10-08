@@ -401,8 +401,12 @@ where
         true
     }
 
-    fn can_suspend_turn(&self, _config: &AgentConfig) -> bool {
-        true
+    fn turn_suspension(
+        &self,
+        _thread: exoharness::ThreadId,
+        _config: &AgentConfig,
+    ) -> crate::TurnSuspension {
+        crate::TurnSuspension::AtToolBoundary
     }
 
     async fn prepare_conversation(

@@ -428,7 +428,9 @@ TUI stop waiting at suspension; stream observers may stay attached for resume.
 Cancellation ends a suspended turn. Executors that cannot reconcile unresolved
 tools defer suspension until their outstanding tool requests have results,
 including approvals. Unsupported suspension returns `false` without saving a
-pause. Resuming during that wait clears the pending suspension.
+pause. A TypeScript turn can suspend only after its running guest declared
+`resumeTurn`; it suspends immediately only if the guest also declared
+`reconcileUnresolvedToolCalls`. Resuming during that wait clears the pending suspension.
 The coordinator's control watch delivers changes during execution, including
 writes from another backend worker.
 
@@ -491,6 +493,8 @@ Host-to-guest messages:
 
 Guest-to-host messages:
 
+- `capabilities`: sent once after the module loads; declares whether the harness
+  implements `resumeTurn` and `reconcileUnresolvedToolCalls`.
 - `runtime_request`: asks Rust to execute a tool or manage a sandbox process.
 - `exo_request`: asks Rust to perform a core Exoharness protocol request.
 - `stream_event`: forwards stream output to the executor stream.

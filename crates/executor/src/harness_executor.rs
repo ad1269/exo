@@ -74,6 +74,17 @@ pub enum ExecutorStreamMode<'a> {
     Enabled(&'a mpsc::UnboundedSender<Result<ExecutionStreamEvent>>),
 }
 
+/// How an executor suspends a running turn so it can resume later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnSuspension {
+    /// The turn cannot resume, so suspension is refused.
+    Unsupported,
+    /// The turn suspends once its outstanding tool requests have results.
+    AtToolBoundary,
+    /// The turn suspends immediately; resume reconciles unresolved tool calls.
+    Immediate,
+}
+
 #[async_trait]
 pub trait HarnessExecutor: Send + Sync + 'static {
     fn with_state(&self, _state: Arc<dyn ExoHarness>) -> Result<Arc<dyn HarnessExecutor>> {
@@ -94,9 +105,13 @@ pub trait HarnessExecutor: Send + Sync + 'static {
         false
     }
 
-    /// Whether unfinished execution can be suspended and resumed.
-    fn can_suspend_turn(&self, _config: &AgentConfig) -> bool {
-        false
+    /// How unfinished execution on `thread` can be suspended and resumed.
+    fn turn_suspension(
+        &self,
+        _thread: exoharness::ThreadId,
+        _config: &AgentConfig,
+    ) -> TurnSuspension {
+        TurnSuspension::Unsupported
     }
 
     fn agent_config(

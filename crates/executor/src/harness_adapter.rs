@@ -12,7 +12,7 @@ use crate::harness::{
     Harness, HarnessCommand, HarnessEvent, HarnessEventSink, HarnessTurnKey, HarnessTurnOutcome,
 };
 use crate::harness_events::HarnessTurn;
-use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
+use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor, TurnSuspension};
 use crate::runtime_host::RuntimeHost;
 use crate::{AgentConfig, ConversationConfig, ExecutionStreamEvent};
 
@@ -85,6 +85,14 @@ impl ExecutorHarness {
             .turns
             .get(&key)
             .is_some_and(|control| matches!(*control.borrow(), None | Some(StopReason::Suspend)))
+    }
+
+    pub(crate) fn turn_suspension(
+        &self,
+        thread: exoharness::ThreadId,
+        config: &AgentConfig,
+    ) -> TurnSuspension {
+        self.executor.turn_suspension(thread, config)
     }
 
     pub(crate) fn new(executor: Arc<dyn HarnessExecutor>, host: Arc<dyn RuntimeHost>) -> Self {
@@ -187,7 +195,6 @@ impl Harness<ExecutorTurn> for ExecutorHarness {
                 events.clone(),
                 key,
             ));
-            let resumable = executor.can_suspend_turn(&work.agent_config);
             let reconciles_tools = executor.can_reconcile_unresolved_tool_call(&work.agent_config);
             let execution = async {
                 if work.recovering && !reconciles_tools {
@@ -242,11 +249,15 @@ impl Harness<ExecutorTurn> for ExecutorHarness {
                             match reason {
                                 Some(StopReason::Shutdown) => break HarnessTurnOutcome::Interrupted,
                                 Some(StopReason::Cancel) => break HarnessTurnOutcome::Cancelled,
-                                Some(StopReason::Suspend) if !resumable => {},
-                                Some(StopReason::Suspend) if reconciles_tools => {
-                                    break HarnessTurnOutcome::Suspended;
-                                }
-                                Some(StopReason::Suspend) => suspending = true,
+                                Some(StopReason::Suspend) => match executor
+                                    .turn_suspension(work.thread.record().id, &work.agent_config)
+                                {
+                                    TurnSuspension::Unsupported => {}
+                                    TurnSuspension::AtToolBoundary => suspending = true,
+                                    TurnSuspension::Immediate => {
+                                        break HarnessTurnOutcome::Suspended;
+                                    }
+                                },
                                 None => suspending = false,
                             }
                         },

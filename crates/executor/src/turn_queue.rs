@@ -287,7 +287,13 @@ impl LocalProvider {
             let Some(entry) = self.turns.coordinator.get(thread, key.turn_id).await? else {
                 return Ok(false);
             };
-            if !self.executor.can_suspend_turn(&entry.work.agent_config) {
+            // A running turn is asked through the harness executing it.
+            let config = &entry.work.agent_config;
+            let suspension = match self.turns.active_harness(key) {
+                Some(harness) => harness.turn_suspension(key.thread_id, config),
+                None => self.executor.turn_suspension(key.thread_id, config),
+            };
+            if suspension == crate::TurnSuspension::Unsupported {
                 return Ok(false);
             }
         }

@@ -27,8 +27,16 @@ impl HarnessExecutor for Controlled {
         "queue-test"
     }
 
-    fn can_suspend_turn(&self, config: &AgentConfig) -> bool {
-        config.harness == crate::AgentHarnessKind::Basic
+    fn turn_suspension(
+        &self,
+        _: exoharness::ThreadId,
+        config: &AgentConfig,
+    ) -> crate::TurnSuspension {
+        if config.harness == crate::AgentHarnessKind::Basic {
+            crate::TurnSuspension::AtToolBoundary
+        } else {
+            crate::TurnSuspension::Unsupported
+        }
     }
 
     async fn cancel_turn(&self, _: &dyn ThreadHandle, _: &AgentConfig) -> Result<()> {
