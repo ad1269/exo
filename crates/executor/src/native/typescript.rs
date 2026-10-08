@@ -2,13 +2,13 @@ use crate::{TypeScriptStreamEvent, to_execution_stream_event};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context as AnyhowContext, anyhow, bail};
 use async_trait::async_trait;
 use exoharness::{
-    AgentHandle, ConversationHandle, ExoHarness, Result, TurnHandle,
+    AgentHandle, ConversationHandle, ExoHarness, Result, ThreadId, TurnHandle,
     protocol::{Request as ExoRequest, Response as ExoResponse},
     server::ExoHarnessServer,
 };
@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::execution_tracing::TurnExecutionTrace;
-use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
+use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor, TurnSuspension};
 use crate::shared::try_send_stream_event;
 #[cfg(test)]
 use crate::typescript_runtime::latest_sandbox_process_event_cursor_from_fetch;
@@ -40,7 +40,24 @@ pub struct TypeScriptExecutor<T> {
     workspace_root: PathBuf,
     env: Arc<HashMap<String, String>>,
     tools: Arc<T>,
-    runners: Arc<Mutex<HashMap<String, Arc<Mutex<TypeScriptRunnerProcess>>>>>,
+    runners: StdMutex<HashMap<String, CachedRunner>>,
+}
+
+#[derive(Clone)]
+struct CachedRunner {
+    process: Arc<Mutex<TypeScriptRunnerProcess>>,
+    capabilities: Arc<OnceLock<GuestCapabilities>>,
+}
+
+/// What the loaded harness module supports, declared by the guest once at startup.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct GuestCapabilities {
+    resume_turn: bool,
+    reconcile_unresolved_tool_calls: bool,
+}
+
+fn runner_key(thread: ThreadId, module_path: &str) -> String {
+    format!("{thread}:{module_path}")
 }
 
 impl<T> TypeScriptExecutor<T> {
@@ -55,7 +72,7 @@ impl<T> TypeScriptExecutor<T> {
             workspace_root,
             env: Arc::new(env),
             tools,
-            runners: Arc::new(Mutex::new(HashMap::new())),
+            runners: StdMutex::default(),
         }
     }
 }
@@ -73,8 +90,30 @@ where
         config.typescript.is_some()
     }
 
-    fn can_suspend_turn(&self, config: &AgentConfig) -> bool {
-        config.typescript.is_some()
+    fn turn_suspension(&self, thread: ThreadId, config: &AgentConfig) -> TurnSuspension {
+        let Some(module) = config.typescript.as_ref() else {
+            return TurnSuspension::Unsupported;
+        };
+        let capabilities = self
+            .runners
+            .lock()
+            .expect("TypeScript runners poisoned")
+            .get(&runner_key(thread, &module.module_path))
+            .and_then(|runner| runner.capabilities.get().copied());
+        match capabilities {
+            Some(GuestCapabilities {
+                resume_turn: true,
+                reconcile_unresolved_tool_calls: true,
+            }) => TurnSuspension::Immediate,
+            Some(GuestCapabilities {
+                resume_turn: true,
+                reconcile_unresolved_tool_calls: false,
+            }) => TurnSuspension::AtToolBoundary,
+            Some(GuestCapabilities {
+                resume_turn: false, ..
+            })
+            | None => TurnSuspension::Unsupported,
+        }
     }
 
     async fn cancel_turn(
@@ -86,20 +125,25 @@ where
             .typescript
             .as_ref()
             .ok_or_else(|| anyhow!("missing TypeScript module"))?;
-        let key = format!("{}:{}", thread.record().id, module.module_path);
-        let runner = self.runners.lock().await.remove(&key);
+        let key = runner_key(thread.record().id, &module.module_path);
+        let runner = self
+            .runners
+            .lock()
+            .expect("TypeScript runners poisoned")
+            .remove(&key);
         if let Some(runner) = runner {
-            runner.lock().await.shutdown().await?;
+            runner.process.lock().await.shutdown().await?;
         }
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {
-        let runners = std::mem::take(&mut *self.runners.lock().await);
+        let runners =
+            std::mem::take(&mut *self.runners.lock().expect("TypeScript runners poisoned"));
         let results = futures::future::join_all(
             runners
                 .into_values()
-                .map(|runner| async move { runner.lock().await.shutdown().await }),
+                .map(|runner| async move { runner.process.lock().await.shutdown().await }),
         )
         .await;
         for result in results {
@@ -186,62 +230,68 @@ where
             bail!("typescript harness module does not exist: {module_path}");
         }
 
-        let key = format!("{}:{}", turn.conversation.record().id, module_path);
-        let mut runner = self
-            .runner(&key, &module_path, Arc::clone(&turn.conversation))
+        let key = runner_key(turn.conversation.record().id, &module_path);
+        let mut runner = self.runner(&key, &module_path, Arc::clone(&turn.conversation))?;
+        let processes_running = runner
+            .process
+            .lock()
+            .await
+            .reusable_processes_are_running()
             .await?;
-        let processes_running = runner.lock().await.reusable_processes_are_running().await?;
         if !processes_running {
-            self.remove_runner(&key, &runner).await;
-            if let Err(error) = runner.lock().await.shutdown().await {
+            self.remove_runner(&key, &runner);
+            if let Err(error) = runner.process.lock().await.shutdown().await {
                 tracing::debug!(%error, "retired TypeScript runner after its sandbox process stopped");
             }
-            runner = self
-                .runner(&key, &module_path, Arc::clone(&turn.conversation))
-                .await?;
+            runner = self.runner(&key, &module_path, Arc::clone(&turn.conversation))?;
         }
         let result = {
-            let mut runner = runner.lock().await;
-            runner.execute_turn(self, turn).await
+            let mut process = runner.process.lock().await;
+            process.execute_turn(self, turn).await
         };
 
         if result.is_err() {
-            self.remove_runner(&key, &runner).await;
-            if let Err(error) = runner.lock().await.shutdown().await {
+            self.remove_runner(&key, &runner);
+            if let Err(error) = runner.process.lock().await.shutdown().await {
                 tracing::warn!(%error, "failed to stop TypeScript runner after a failed turn");
             }
         }
 
         result
     }
-    async fn runner(
+    fn runner(
         &self,
         key: &str,
         module_path: &str,
         thread: Arc<dyn ConversationHandle>,
-    ) -> Result<Arc<Mutex<TypeScriptRunnerProcess>>> {
-        let mut runners = self.runners.lock().await;
+    ) -> Result<CachedRunner> {
+        let mut runners = self.runners.lock().expect("TypeScript runners poisoned");
         if let Some(runner) = runners.get(key) {
-            return Ok(Arc::clone(runner));
+            return Ok(runner.clone());
         }
 
-        let runner = Arc::new(Mutex::new(TypeScriptRunnerProcess::start(
-            &self.workspace_root,
-            self.env.as_ref(),
-            module_path,
-            thread,
-            self.tools.clone(),
-        )?));
-        runners.insert(key.to_string(), Arc::clone(&runner));
+        let capabilities = Arc::new(OnceLock::new());
+        let runner = CachedRunner {
+            process: Arc::new(Mutex::new(TypeScriptRunnerProcess::start(
+                &self.workspace_root,
+                self.env.as_ref(),
+                module_path,
+                thread,
+                self.tools.clone(),
+                Arc::clone(&capabilities),
+            )?)),
+            capabilities,
+        };
+        runners.insert(key.to_string(), runner.clone());
         Ok(runner)
     }
 
-    async fn remove_runner(&self, module_path: &str, runner: &Arc<Mutex<TypeScriptRunnerProcess>>) {
-        let mut runners = self.runners.lock().await;
-        if let Some(current) = runners.get(module_path)
-            && Arc::ptr_eq(current, runner)
+    fn remove_runner(&self, key: &str, runner: &CachedRunner) {
+        let mut runners = self.runners.lock().expect("TypeScript runners poisoned");
+        if let Some(current) = runners.get(key)
+            && Arc::ptr_eq(&current.process, &runner.process)
         {
-            runners.remove(module_path);
+            runners.remove(key);
         }
     }
 }
@@ -255,6 +305,7 @@ struct TypeScriptRunnerProcess {
     stderr_task: Option<JoinHandle<std::io::Result<String>>>,
     _writer_task: JoinHandle<anyhow::Result<()>>,
     runtime: Arc<TypeScriptRuntime>,
+    capabilities: Arc<OnceLock<GuestCapabilities>>,
 }
 
 struct TypeScriptTurn<'a> {
@@ -288,6 +339,7 @@ impl TypeScriptRunnerProcess {
         module_path: &str,
         thread: Arc<dyn ConversationHandle>,
         tools: Arc<dyn ToolRuntime>,
+        capabilities: Arc<OnceLock<GuestCapabilities>>,
     ) -> Result<Self> {
         let runner_path = workspace_root
             .join("exoharness")
@@ -363,6 +415,7 @@ impl TypeScriptRunnerProcess {
             stderr_task: Some(stderr_task),
             _writer_task: writer_task,
             runtime,
+            capabilities,
         })
     }
 
@@ -483,6 +536,11 @@ impl TypeScriptRunnerProcess {
                         GuestToHostMessage::StreamEvent { event } => {
                             if let ExecutorStreamMode::Enabled(event_tx) = stream_mode {
                                 try_send_stream_event(event_tx, to_execution_stream_event(event));
+                            }
+                        }
+                        GuestToHostMessage::Capabilities(capabilities) => {
+                            if self.capabilities.set(capabilities).is_err() {
+                                bail!("typescript harness declared its capabilities twice");
                             }
                         }
                         GuestToHostMessage::Done => return Ok(()),
@@ -657,6 +715,7 @@ fn runtime_response(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum GuestToHostMessage {
+    Capabilities(GuestCapabilities),
     RuntimeRequest {
         id: u64,
         request: RuntimeRequest,
@@ -711,6 +770,7 @@ fn format_error_chain(error: &anyhow::Error, context: std::fmt::Arguments<'_>) -
 #[cfg(test)]
 mod tests {
     use crate::ExecutionStreamEvent;
+    use crate::harness::HarnessTurnKey;
     use exoharness::{CancelSandboxProcessRequest, SandboxId, SandboxProcessId};
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
@@ -1137,6 +1197,171 @@ export default {
         );
         runtime.shutdown().await?;
         Ok(())
+    }
+
+    struct SuspensionTest {
+        runtime: crate::Runtime,
+        agent: Arc<dyn AgentHandle>,
+        thread: Arc<dyn ConversationHandle>,
+        config: AgentConfig,
+        release: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    impl SuspensionTest {
+        async fn new(harness: &str) -> Result<Self> {
+            use crate::{
+                BasicToolRuntime, LocalProvider, Runtime, test_support::local_test_config,
+            };
+            use exoharness::{BasicExoHarness, NewAgentRequest};
+
+            let temp = tempfile::TempDir::new()?;
+            let release = temp.path().join("release");
+            let module = temp.path().join("suspension.mjs");
+            std::fs::write(
+                &module,
+                format!(
+                    r#"
+import {{ existsSync }} from "node:fs";
+const release = {};
+async function run(context, text) {{
+  await context.stream.text(text);
+  while (!existsSync(release)) await new Promise((resolve) => setTimeout(resolve, 10));
+}}
+export default {harness};
+"#,
+                    serde_json::to_string(&release)?
+                ),
+            )?;
+            let state =
+                Arc::new(BasicExoHarness::new(local_test_config(temp.path().join("state"))).await?);
+            let agent = state
+                .new_agent(NewAgentRequest {
+                    slug: "suspension".into(),
+                    name: "Suspension".into(),
+                    vaults: vec![],
+                })
+                .await?;
+            let thread = agent.new_conversation(Default::default()).await?;
+            let config = serde_json::from_value(serde_json::json!({
+                "instructions": [], "harness": "typescript",
+                "typescript": { "module_path": module },
+                "sandbox": { "provider": "local_process" }, "model": "gpt-5-mini"
+            }))?;
+            let runtime = Runtime::new(
+                LocalProvider::typescript(
+                    state,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+                    HashMap::new(),
+                    Arc::new(BasicToolRuntime),
+                ),
+                None,
+            );
+            Ok(Self {
+                runtime,
+                agent,
+                thread,
+                config,
+                release,
+                _temp: temp,
+            })
+        }
+
+        async fn start(&self) -> Result<(HarnessTurnKey, crate::ExecutionStreamHandle)> {
+            let (turn, mut stream) = self
+                .runtime
+                .start_turn(
+                    self.agent.clone(),
+                    self.thread.clone(),
+                    SendRequest {
+                        input: vec![],
+                        session_id: None,
+                    },
+                    true,
+                    Some(self.config.clone()),
+                    Default::default(),
+                )
+                .await?;
+            assert_eq!(next_text(&mut stream).await?, "running");
+            let key = HarnessTurnKey::new(self.agent.record().id, self.thread.record().id, turn.id);
+            Ok((key, stream))
+        }
+    }
+
+    async fn next_text(stream: &mut crate::ExecutionStreamHandle) -> Result<String> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                if let ExecutionStreamEvent::Chunk(chunk) = event? {
+                    let text: String = chunk
+                        .choices
+                        .into_iter()
+                        .filter_map(|choice| choice.delta_view().and_then(|delta| delta.content))
+                        .collect();
+                    if !text.is_empty() {
+                        return Ok(text);
+                    }
+                }
+            }
+            anyhow::bail!("stream ended before text")
+        })
+        .await?
+    }
+
+    async fn finish(stream: &mut crate::ExecutionStreamHandle) -> Result<ExecutionStreamEvent> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                if let event @ (ExecutionStreamEvent::Completed(_)
+                | ExecutionStreamEvent::Suspended(_)) = event?
+                {
+                    return Ok(event);
+                }
+            }
+            anyhow::bail!("stream ended without completion")
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn suspension_is_unsupported_when_the_guest_cannot_resume() -> Result<()> {
+        let test =
+            SuspensionTest::new(r#"{ async runTurn(context) { await run(context, "running"); } }"#)
+                .await?;
+        let (key, mut stream) = test.start().await?;
+
+        assert!(!test.runtime.suspend_turn(key).await?);
+        std::fs::write(&test.release, "")?;
+        assert!(matches!(
+            finish(&mut stream).await?,
+            ExecutionStreamEvent::Completed(_)
+        ));
+        test.runtime.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn suspension_resumes_a_guest_that_declares_resume_turn() -> Result<()> {
+        let test = SuspensionTest::new(
+            r#"{
+  reconcileUnresolvedToolCalls: true,
+  async runTurn(context) { await run(context, "running"); },
+  async resumeTurn(context) { await run(context, "resumed"); }
+}"#,
+        )
+        .await?;
+        let (key, mut stream) = test.start().await?;
+
+        assert!(test.runtime.suspend_turn(key).await?);
+        assert!(matches!(
+            finish(&mut stream).await?,
+            ExecutionStreamEvent::Suspended(_)
+        ));
+        let mut resumed = test.runtime.resume_turn(key).await?;
+        assert_eq!(next_text(&mut resumed).await?, "resumed");
+        std::fs::write(&test.release, "")?;
+        assert!(matches!(
+            finish(&mut resumed).await?,
+            ExecutionStreamEvent::Completed(_)
+        ));
+        test.runtime.shutdown().await
     }
 
     #[tokio::test]

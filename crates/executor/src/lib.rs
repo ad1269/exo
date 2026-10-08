@@ -47,7 +47,7 @@ pub use exoharness::{
     run_firecracker_bridge,
 };
 pub use harness_config::{find_agent_config, load_agent_config, load_conversation_config};
-pub use harness_executor::{ExecutorStreamMode, HarnessExecutor, Runtime};
+pub use harness_executor::{ExecutorStreamMode, HarnessExecutor, Runtime, TurnSuspension};
 pub use harness_helpers::{
     get_conversation_model_override, materialize_conversation_messages,
     put_conversation_model_override,

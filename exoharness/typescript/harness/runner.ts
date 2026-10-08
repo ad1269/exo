@@ -132,6 +132,15 @@ class ProtocolClient {
     );
   }
 
+  async declareCapabilities(harness: TypeScriptHarness): Promise<void> {
+    await this.send({
+      kind: "capabilities",
+      resume_turn: harness.resumeTurn !== undefined,
+      reconcile_unresolved_tool_calls:
+        harness.reconcileUnresolvedToolCalls === true,
+    });
+  }
+
   async done(): Promise<void> {
     await this.send({ kind: "done" });
   }
@@ -291,6 +300,7 @@ async function main(): Promise<void> {
     await client.fail(error);
     throw error;
   }
+  await client.declareCapabilities(harness);
 
   for (;;) {
     const init = await client.nextInit();

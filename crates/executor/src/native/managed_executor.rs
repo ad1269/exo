@@ -4,7 +4,7 @@ use crate::native::config;
 use crate::native::managed_mcp::{PreparedMcp, connect_mcp};
 use crate::{
     AgentConfig, AgentHarnessKind, BasicExecutor, BasicToolRuntime, ConversationConfig,
-    ExoToolRuntime, McpToolRuntime, RouterModelClient, SendRequest,
+    ExoToolRuntime, McpToolRuntime, RouterModelClient, SendRequest, TurnSuspension,
 };
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -158,11 +158,21 @@ impl HarnessExecutor for ManagedExecutor {
         config.harness == AgentHarnessKind::Basic
     }
 
-    fn can_suspend_turn(&self, config: &AgentConfig) -> bool {
-        matches!(
-            config.harness,
-            AgentHarnessKind::Basic | AgentHarnessKind::TypeScript
-        )
+    fn turn_suspension(&self, thread: ThreadId, config: &AgentConfig) -> TurnSuspension {
+        match config.harness {
+            AgentHarnessKind::Basic => TurnSuspension::AtToolBoundary,
+            // Only the running guest module knows whether it can resume.
+            AgentHarnessKind::TypeScript => self
+                .threads
+                .lock()
+                .expect("managed executors poisoned")
+                .get(&thread)
+                .and_then(|cell| cell.get())
+                .map_or(TurnSuspension::Unsupported, |prepared| {
+                    prepared.executor.turn_suspension(thread, config)
+                }),
+            AgentHarnessKind::Rlm | AgentHarnessKind::Exo => TurnSuspension::Unsupported,
+        }
     }
 
     fn can_reconcile_unresolved_tool_call(&self, config: &AgentConfig) -> bool {
