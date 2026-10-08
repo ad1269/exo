@@ -712,7 +712,9 @@ impl Runtime {
                     finalize_turn(turn.as_ref(), Err(anyhow!("harness turn cancelled"))).await
                 }
                 Ok(HarnessTurnOutcome::Suspended) => Err(crate::turn_queue::TurnSuspended.into()),
-                Ok(HarnessTurnOutcome::Interrupted) => Err(anyhow!("harness turn interrupted")),
+                Ok(HarnessTurnOutcome::Interrupted) => {
+                    Err(crate::turn_queue::TurnInterrupted.into())
+                }
                 Err(error) => {
                     finalize_turn(
                         turn.as_ref(),

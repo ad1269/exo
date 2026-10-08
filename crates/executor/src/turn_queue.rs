@@ -34,6 +34,17 @@ impl std::fmt::Display for TurnSuspended {
 }
 impl std::error::Error for TurnSuspended {}
 
+/// The executing harness shut down. The head stays queued for restart even when
+/// only a caller-scoped runtime stopped and the shared queue is not draining.
+#[derive(Debug)]
+pub(crate) struct TurnInterrupted;
+impl std::fmt::Display for TurnInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("harness turn interrupted")
+    }
+}
+impl std::error::Error for TurnInterrupted {}
+
 struct TurnContext {
     runtime: Runtime,
     observers: Vec<mpsc::UnboundedSender<Result<ExecutionStreamEvent>>>,
@@ -661,6 +672,13 @@ impl Runtime {
                     turns.broadcast(key, result.map(ExecutionStreamEvent::Completed))
                 }
                 _ if turns.draining.load(Ordering::SeqCst) => return Ok(()),
+                _ if error
+                    .as_ref()
+                    .is_some_and(|error| error.is::<TurnInterrupted>()) =>
+                {
+                    turns.stop_observers(key, &TurnInterrupted.into());
+                    return Ok(());
+                }
                 status => {
                     let current = turns
                         .coordinator

@@ -1480,6 +1480,257 @@ async fn graceful_shutdown_leaves_active_turn_for_restart() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct BlockingCallerExecutor {
+    block: bool,
+    entered: Arc<tokio::sync::Notify>,
+    callers: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl HarnessExecutor for BlockingCallerExecutor {
+    fn with_state(&self, _: Arc<dyn ExoHarness>) -> Result<Arc<dyn HarnessExecutor>> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn name(&self) -> &'static str {
+        "blocking-caller"
+    }
+
+    async fn execute_turn(
+        &self,
+        _: &dyn AgentHandle,
+        thread: Arc<dyn ConversationHandle>,
+        _: Arc<dyn TurnHandle>,
+        _: &crate::AgentConfig,
+        _: &crate::ConversationConfig,
+        _: &SendRequest,
+        _: ExecutorStreamMode<'_>,
+        _: Option<&dyn crate::execution_tracing::TurnExecutionTrace>,
+    ) -> Result<()> {
+        self.callers
+            .lock()
+            .expect("caller record poisoned")
+            .push(thread.caller().map(|caller| caller.principal.clone()));
+        if self.block {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn resume_turn(
+        &self,
+        agent: &dyn AgentHandle,
+        thread: Arc<dyn ConversationHandle>,
+        turn: Arc<dyn TurnHandle>,
+        agent_config: &crate::AgentConfig,
+        conversation_config: &crate::ConversationConfig,
+        request: &SendRequest,
+        stream_mode: ExecutorStreamMode<'_>,
+        turn_trace: Option<&dyn crate::execution_tracing::TurnExecutionTrace>,
+    ) -> Result<()> {
+        self.execute_turn(
+            agent,
+            thread,
+            turn,
+            agent_config,
+            conversation_config,
+            request,
+            stream_mode,
+            turn_trace,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn caller_shutdown_leaves_active_turn_for_restart() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let root = tempdir.path().join("exoharness");
+    let state = Arc::new(BasicExoHarness::new(local_test_config(&root)).await?);
+    let queue = state.turn_coordinator::<TurnWork>();
+    let blocking = BlockingCallerExecutor {
+        block: true,
+        ..Default::default()
+    };
+    let runtime = Runtime::new(
+        LocalProvider::new(state.clone(), Arc::new(blocking.clone()))
+            .with_turn_coordinator(queue.clone()),
+        None,
+    );
+    create_test_credential(state.as_ref()).await;
+    let agent = runtime
+        .create_agent(CreateAgentRequest {
+            ..crate::test_support::agent_request("caller-shutdown", crate::AgentHarnessKind::Basic)
+        })
+        .await?;
+    let thread = runtime
+        .create_conversation(agent.as_ref(), CreateConversationRequest::default())
+        .await?;
+    let agent_id = agent.record().id;
+    let thread_id = thread.record().id;
+    let policy: Arc<dyn AccessPolicy> = Arc::new(RecoveryPolicy(
+        exoharness::vault::global_vault(state.as_ref())
+            .await?
+            .record()
+            .id,
+    ));
+    let caller = runtime.with_caller(Caller {
+        principal: "alice".into(),
+        policy: Arc::clone(&policy),
+    })?;
+    let caller_agent = caller
+        .exoharness_handle()
+        .get_agent(&agent_id)
+        .await?
+        .unwrap();
+    let caller_thread = caller_agent.get_thread(&thread_id).await?.unwrap();
+    let mut turns = Vec::new();
+    for input in ["running at shutdown", "queued behind it"] {
+        let (turn, stream) = caller
+            .start_turn(
+                Arc::clone(&caller_agent),
+                Arc::clone(&caller_thread),
+                SendRequest {
+                    input: vec![user_message(input)],
+                    session_id: None,
+                },
+                false,
+                None,
+                Default::default(),
+            )
+            .await?;
+        turns.push((turn.id, stream));
+    }
+    tokio::time::timeout(Duration::from_secs(3), blocking.entered.notified()).await?;
+    // Mirrors `exo serve`: caller runtimes stop before the root runtime.
+    caller.shutdown().await?;
+    // Let the queue worker observe the caller shutdown before the root drains.
+    use exoharness::turn_coordinator::{TurnQueue, TurnThread};
+    let scope = TurnThread {
+        agent_id,
+        thread_id,
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while queue.claim(scope).await?.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    runtime.shutdown().await?;
+    for (_, stream) in &mut turns {
+        assert!(matches!(stream.next().await, Some(Err(_))));
+    }
+    let turn_ids: Vec<_> = turns.iter().map(|(id, _)| *id).collect();
+    let events = thread.get_events(None).await?.events;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.data, EventData::TurnEnded | EventData::Error { .. })),
+        "caller shutdown must not finish retained turns: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.turn_id == Some(turn_ids[1])),
+        "queued turn must not start against a stopped caller harness: {events:?}"
+    );
+    for (index, turn_id) in turn_ids.iter().enumerate() {
+        let entry = queue
+            .get(scope, *turn_id)
+            .await?
+            .expect("caller shutdown must retain queued turns");
+        assert_eq!(entry.started, index == 0);
+    }
+    drop(caller_thread);
+    drop(caller_agent);
+    drop(caller);
+    drop(thread);
+    drop(agent);
+    drop(runtime);
+    drop(state);
+
+    let state = Arc::new(BasicExoHarness::new(local_test_config(&root)).await?);
+    let queue = state.turn_coordinator::<TurnWork>();
+    let recorder = BlockingCallerExecutor::default();
+    let runtime = Runtime::new(
+        LocalProvider::new(state.clone(), Arc::new(recorder.clone()))
+            .with_turn_coordinator(queue.clone()),
+        None,
+    );
+    let scoped_runtimes: Arc<Mutex<Vec<Arc<Runtime>>>> = Arc::default();
+    let resolver: RecoveryRuntimeResolver = {
+        let root = runtime.clone();
+        let policy = Arc::clone(&policy);
+        let scoped_runtimes = Arc::clone(&scoped_runtimes);
+        Arc::new(move |principal| {
+            let scoped = Arc::new(root.with_caller(Caller {
+                principal,
+                policy: Arc::clone(&policy),
+            })?);
+            scoped_runtimes
+                .lock()
+                .expect("scoped runtimes poisoned")
+                .push(Arc::clone(&scoped));
+            Ok(scoped)
+        })
+    };
+    runtime.set_recovery_resolver(resolver)?;
+    runtime.recover_unfinished_turns().await?;
+    let agent = state.get_agent(&agent_id).await?.unwrap();
+    let thread = agent.get_thread(&thread_id).await?.unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = thread.get_events(None).await?.events;
+            let ended = events
+                .iter()
+                .filter(|event| matches!(event.data, EventData::TurnEnded))
+                .count();
+            if ended == turn_ids.len() {
+                return Ok::<_, anyhow::Error>(events);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.data, EventData::Error { .. })),
+        "retained turns should resume cleanly: {events:?}"
+    );
+    for turn_id in &turn_ids {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.turn_id == Some(*turn_id)
+                    && matches!(event.data, EventData::TurnStarted { .. }))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        recorder
+            .callers
+            .lock()
+            .expect("caller record poisoned")
+            .as_slice(),
+        &[Some("alice".into()), Some("alice".into())]
+    );
+    let scoped = scoped_runtimes
+        .lock()
+        .expect("scoped runtimes poisoned")
+        .drain(..)
+        .collect::<Vec<_>>();
+    for scoped in scoped {
+        scoped.shutdown().await?;
+    }
+    runtime.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn blocked_recovered_turn_does_not_block_http_startup() -> Result<()> {
     let tempdir = TempDir::new()?;
